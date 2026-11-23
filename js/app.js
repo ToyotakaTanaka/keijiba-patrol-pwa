@@ -79,6 +79,8 @@ function setHeader(title, left, right) {
   };
   slot($("#hleft"), left); slot($("#hright"), right);
 }
+/** 地図ボタン（折りたたんだ地図の形＋「地図」）。絵文字は端末で見え方が変わるため使わない。 */
+const MAP_ICON = `<span class="iconlabel"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="currentColor"><path d="M9 3 3 5.4v15.6l6-2.4 6 2.4 6-2.4V3l-6 2.4L9 3Zm1 2.3 4 1.6v12.8l-4-1.6V5.3ZM5 6.7l3-1.2v12.8l-3 1.2V6.7Zm11 .2 3-1.2v12.8l-3 1.2V6.9Z"/></svg><small>地図</small></span>`;
 const gear = { icon: "⚙︎", label: "設定", onClick: () => go("settings") };
 const backTo = (v) => ({ icon: "‹", label: "戻る", onClick: () => go(v) });
 
@@ -117,7 +119,7 @@ function renderEmpty(v) {
 }
 
 function renderRoute(v) {
-  setHeader("巡回順", { icon: "🗺", label: "地図で見る", onClick: () => go("map") }, gear);
+  setHeader("巡回順", { icon: MAP_ICON, label: "地図で見る", onClick: () => go("map") }, gear);
   const r = routeBoards(), a = assignedBoards();
   const csv = C.roundTrip(state.home, a), plan = C.roundTrip(state.home, r);
   const ok = state.progress.route.length === state.progress.assigned.length && new Set(state.progress.route).size === state.progress.route.length;

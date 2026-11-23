@@ -25,6 +25,8 @@ header h1 { flex: 1; margin: 0; text-align: center; font-size: 22px; font-weight
 .hbtn { width: 56px; display: flex; }
 .hbtn.right { justify-content: flex-end; }
 .hbtn button { background: none; border: 0; color: #fff; font-size: 24px; width: 44px; height: 44px; border-radius: 22px; cursor: pointer; }
+.hbtn button .iconlabel { display: flex; flex-direction: column; align-items: center; line-height: 1; gap: 2px; }
+.hbtn button .iconlabel small { font-size: 10px; font-weight: 700; }
 .hbtn button:active { background: rgba(255,255,255,.15); }
 
 main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; }
