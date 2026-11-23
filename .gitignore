@@ -1,0 +1,22 @@
+# 秘密情報・環境ごとの設定は入れない
+.env
+.env.*
+!.env.example
+.vercel/
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.xcconfig
+credentials*.json
+service-account*.json
+
+# 実データは入れない（利用条件を確認したものだけ、出典つきで data/ に置く）
+*.osm.pbf
+private/
+local-data/
+
+# その他
+node_modules/
+.DS_Store
+*.log

@@ -1,0 +1,6 @@
+test/
+README.md
+LICENSE
+package.json
+.github/
+.gitleaks.toml

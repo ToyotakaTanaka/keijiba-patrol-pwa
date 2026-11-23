@@ -1,0 +1,9 @@
+{
+  "name": "keijiba-patrol-pwa",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/core.test.mjs",
+    "start": "python3 -m http.server 8781 --bind 127.0.0.1"
+  }
+}
