@@ -6,7 +6,7 @@ import * as S from "./store.js";
 // 同梱するのは架空の見本だけ。実際の掲示場の一覧は、各自治体の公開データなどを CSV で取り込む。
 const BUNDLED_ID = "bundled-sample";
 const BUNDLED_NAME = "見本（架空の掲示場）";
-/** 見本の出発地点（横須賀中央駅の近く。目安の位置）。 */
+/** 見本の出発地点（架空。見本の掲示場の近くの目安の位置）。 */
 const SAMPLE_HOME = { lat: 35.2785, lon: 139.6700 };
 
 const $ = (sel) => document.querySelector(sel);

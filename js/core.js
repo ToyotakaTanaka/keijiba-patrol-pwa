@@ -5,17 +5,17 @@ export const MAX_BYTES = 5 * 1024 * 1024;
 export const MAX_ROWS = 10000;
 
 export const FIELDS = [
-  { key: "number", label: "番号", required: true, yokosuka: "図面表示番号",
+  { key: "number", label: "番号", required: true,
     aliases: ["図面表示番号", "掲示場番号", "ポスター掲示場番号", "掲示板番号", "表示番号", "図面番号", "番号", "number", "id", "コード"],
     contains: ["番号"] },
-  { key: "name", label: "掲示場名", required: true, yokosuka: "掲示場名",
+  { key: "name", label: "掲示場名", required: true,
     aliases: ["掲示場名", "掲示場名称", "名称", "名前", "施設名", "場所名", "設置名", "name"],
     contains: ["名称", "名"] },
-  { key: "latitude", label: "緯度", required: true, yokosuka: "緯度",
+  { key: "latitude", label: "緯度", required: true,
     aliases: ["緯度", "lat", "latitude", "y座標", "y"], contains: ["緯度", "lat"] },
-  { key: "longitude", label: "経度", required: true, yokosuka: "経度",
+  { key: "longitude", label: "経度", required: true,
     aliases: ["経度", "lng", "lon", "long", "longitude", "x座標", "x"], contains: ["経度", "lng", "lon"] },
-  { key: "address", label: "設置場所", required: false, yokosuka: "設置場所",
+  { key: "address", label: "設置場所", required: false,
     aliases: ["設置場所", "所在地", "住所", "設置住所", "場所", "address"], contains: ["住所", "所在", "設置場所"] },
 ];
 
@@ -92,7 +92,7 @@ export function parseNumber(s) {
   return Number.isFinite(v) ? v : null;
 }
 
-/** 列の自動割り当て。1) 横須賀市の見出し・よくある別名 2) 含む語 3) 値から緯度・経度を推定。 */
+/** 列の自動割り当て。1) よく使われる見出し・別名 2) 含む語 3) 値から緯度・経度を推定。 */
 export function autoMapping(headers, rows = []) {
   const m = {};
   const keys = headers.map(normalizeHeader);

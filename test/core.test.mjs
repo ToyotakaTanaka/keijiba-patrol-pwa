@@ -14,7 +14,7 @@ const sm = C.autoMapping(st.headers, st.rows);
 const sample = C.buildBoards(st, sm);
 check(C.mappingProblems(sm).ok && sample.boards.length === 10 && sample.issues.length === 0, "見本10件を列選択なしで読める");
 
-// 横須賀市のオープンデータと同じ見出しの形（値は架空）
+// 自治体のオープンデータでよく使われる見出しの形（値は架空）
 const y = table("No.,図面表示番号,設置場所,掲示場名,緯度,経度\n1,1-1,架空市1丁目,見本A,35.31,139.62\n2,1-10,架空市2丁目,見本B,35.32,139.63\n");
 const ym = C.autoMapping(y.headers, y.rows);
 check(ym.number === 1 && ym.address === 2 && ym.name === 3, "No. ではなく図面表示番号を番号として使う");
