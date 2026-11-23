@@ -100,14 +100,15 @@ function go(view) { state.view = view; render(); }
 
 // ---------- 画面 ----------
 function render() {
-  $("#mapwrap").hidden = state.view !== "map";
+  const onMap = state.view === "map" || state.view === "pickhome";
+  $("#mapwrap").hidden = !onMap;
   const v = $("#view");
-  v.hidden = state.view === "map";
+  v.hidden = onMap;
   v.scrollTop = 0;
   const ready = state.home && state.progress.route.length;
   if (!ready && ["route", "next", "saved", "done"].includes(state.view)) return renderEmpty(v);
   ({ route: renderRoute, next: renderNext, saved: renderSaved, done: renderDone, settings: renderSettings,
-     picker: renderPicker, lists: renderLists, import: renderImport, map: renderMap, photo: renderPhoto })[state.view](v);
+     picker: renderPicker, lists: renderLists, import: renderImport, map: renderMap, pickhome: renderPickHome, photo: renderPhoto })[state.view](v);
 }
 
 function renderEmpty(v) {
@@ -242,8 +243,7 @@ async function shrink(file) {
 
 // ---------- 地図 ----------
 let map, layers;
-function renderMap() {
-  setHeader("地図で見る", { icon: "✕", label: "閉じる", onClick: () => go("route") }, null);
+function ensureMap() {
   document.documentElement.style.setProperty("--map-top", `${$("#header").offsetHeight}px`);
   if (!map) {
     map = L.map("map", { zoomControl: true });
@@ -253,9 +253,73 @@ function renderMap() {
       maxZoom: 18, attribution: '出典: <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>' });
     pale.addTo(map);
     L.control.layers({ "淡色地図": pale, "標準地図": std }, null, { position: "topright" }).addTo(map);
-    map.on("click", () => { state.mapPick = null; drawCard(); });
+    map.on("click", (e) => {
+      if (state.view === "pickhome") { state.homeDraft = { lat: e.latlng.lat, lon: e.latlng.lng }; drawPickHome(false); return; }
+      state.mapPick = null; drawCard();
+    });
   }
+}
+
+function renderMap() {
+  setHeader("地図で見る", { icon: "✕", label: "閉じる", onClick: () => go("route") }, null);
+  ensureMap();
   setTimeout(() => { map.invalidateSize(); state.mapPick = null; drawCard(); drawMarkers(true); }, 0);
+}
+
+// ---------- 自宅を地図で選ぶ ----------
+function renderPickHome() {
+  setHeader("自宅を地図で選ぶ", { icon: "✕", label: "やめる", onClick: () => { state.homeDraft = null; go("settings"); } }, null);
+  ensureMap();
+  state.homeDraft = state.homeDraft || (state.home ? { ...state.home } : null);
+  setTimeout(() => { map.invalidateSize(); drawPickHome(true); }, 0);
+}
+
+function drawPickHome(fit) {
+  if (layers) layers.remove();
+  layers = L.layerGroup().addTo(map);
+  // 目安として担当の掲示場を薄く出す
+  for (const b of routeBoards()) {
+    L.marker([b.lat, b.lon], { interactive: false, icon: L.divIcon({ className: "", html: '<div class="pin other"></div>', iconSize: [12, 12] }) }).addTo(layers);
+  }
+  const d = state.homeDraft;
+  if (d) {
+    L.marker([d.lat, d.lon], { draggable: true, zIndexOffset: 1000, icon: L.divIcon({ className: "", html: '<div class="pin home">⌂</div>', iconSize: [34, 34] }) })
+      .on("dragend", (e) => { const p = e.target.getLatLng(); state.homeDraft = { lat: p.lat, lon: p.lng }; drawPickHome(false); })
+      .addTo(layers);
+  }
+  if (fit) {
+    if (d) map.setView([d.lat, d.lon], 16);
+    else {
+      const pts = (routeBoards().length ? routeBoards() : list().boards).map((b) => [b.lat, b.lon]);
+      if (pts.length) map.fitBounds(pts, { padding: [30, 30], maxZoom: 15 });
+      else map.setView([35.68, 139.76], 10);
+    }
+  }
+  $("#mapcard").innerHTML = `<div class="mcard">
+    <b>${d ? "この位置を自宅にしますか？" : "地図を押して、自宅の位置を選んでください"}</b>
+    <div class="small">${d ? `${d.lat.toFixed(6)}, ${d.lon.toFixed(6)}（印は指で動かせます）` : "拡大してから押すと、細かく選べます。"}</div>
+    <button class="btn" id="ph-ok" ${d ? "" : "disabled"}>ここを自宅にする</button>
+    <button class="btn outline" id="ph-gps">現在地を使う</button>
+    <div class="privacy" style="text-align:left;max-width:none;margin:0">🔒 自宅の位置はこの端末の中だけに保存され、ほかの人からは見えません。</div></div>`;
+  $("#ph-ok").onclick = async () => { await setHome(state.homeDraft); state.homeDraft = null; go("settings"); };
+  $("#ph-gps").onclick = () => {
+    if (!navigator.geolocation) { toast("この端末では現在地を使えません"); return; }
+    toast("現在地を確かめています…");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { state.homeDraft = { lat: pos.coords.latitude, lon: pos.coords.longitude }; map.setView([state.homeDraft.lat, state.homeDraft.lon], 17); drawPickHome(false); },
+      () => toast("現在地を取れませんでした。地図を押して選んでください"),
+      { enableHighAccuracy: true, timeout: 15000 });
+  };
+}
+
+/** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
+async function setHome(c) {
+  state.home = { lat: c.lat, lon: c.lon }; await S.kvSet("home", state.home);
+  for (const l2 of state.lists.values()) {
+    const pg = await S.kvGet(`progress:${l2.id}`);
+    if (pg) await S.kvSet(`progress:${l2.id}`, replan(pg, l2.boards));
+  }
+  await loadProgress(); toast("自宅を保存しました");
 }
 
 function drawMarkers(fit) {
@@ -342,7 +406,8 @@ function renderSettings(v) {
   <div class="section"><h2>自宅（出発・帰着地点）</h2><div class="group">
     <div class="item">${state.home ? `登録済み: ${state.home.lat.toFixed(6)}, ${state.home.lon.toFixed(6)}` : "未登録"}</div>
     <div class="item"><input type="text" id="s-home" inputmode="decimal" placeholder="緯度,経度（例 35.3159,139.6250）"></div>
-    <button class="item link" id="s-homebtn">自宅を${state.home ? "変更" : "登録"}</button></div>
+    <button class="item link" id="s-homemap">地図で選ぶ・現在地を使う ›</button>
+    <button class="item link" id="s-homebtn">入力した緯度,経度で${state.home ? "変更" : "登録"}</button></div>
     <p class="err" id="s-homeerr"></p></div>
   <div class="section"><h2>担当の掲示場</h2><div class="group">
     <button class="item link" id="s-pick">担当を選ぶ（${state.progress.assigned.length}か所） ›</button>
@@ -358,14 +423,9 @@ function renderSettings(v) {
   $("#s-homebtn").onclick = async () => {
     const c = C.parseLatLon($("#s-home").value);
     if (!c) { $("#s-homeerr").textContent = "「緯度,経度」の形で入力してください。緯度は-90〜90、経度は-180〜180です。"; return; }
-    state.home = c; await S.kvSet("home", c);
-    // 自宅は全一覧で共通なので、全一覧の巡回順を計算し直す
-    for (const l2 of state.lists.values()) {
-      const pg = await S.kvGet(`progress:${l2.id}`);
-      if (pg) await S.kvSet(`progress:${l2.id}`, replan(pg, l2.boards));
-    }
-    await loadProgress(); toast("自宅を保存しました"); render();
+    await setHome(c); render();
   };
+  $("#s-homemap").onclick = () => { state.homeDraft = null; go("pickhome"); };
   $("#s-reset").onclick = async () => {
     if (!confirm(`「${l.name}」の写真${state.done.size}件を消します。元に戻せません。`)) return;
     await S.photoDeleteList(state.activeId); state.done = new Map(); toast("写真を消しました"); render();
