@@ -20,3 +20,5 @@ local-data/
 node_modules/
 .DS_Store
 *.log
+.vercel
+.env*

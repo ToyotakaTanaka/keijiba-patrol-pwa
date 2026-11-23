@@ -4,3 +4,6 @@ LICENSE
 package.json
 .github/
 .gitleaks.toml
+.env
+.env.*
+.vercel
