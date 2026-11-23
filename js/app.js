@@ -110,7 +110,7 @@ function render() {
 
 function renderEmpty(v) {
   setHeader("掲示場巡回", null, gear);
-  v.innerHTML = `<div class="homebig grow"><div><span>🏠</span>自宅と担当の掲示場を<br>登録してください<p class="muted">見本で試すなら「見本を入れる」</p></div></div>
+  v.innerHTML = `<div class="homebig grow"><div><span>🏠</span>自宅と担当の掲示場を<br>登録してください<p class="muted">見本で試すなら「見本を入れる」</p><p class="privacy">🔒 データはこの端末の中だけに保存され、<br>ほかの人からは見えません。</p></div></div>
     <div class="btns"><button class="btn" id="b1">設定を開く</button><button class="btn outline" id="b2">見本を入れる（架空の掲示場10か所）</button></div>`;
   $("#b1").onclick = () => go("settings");
   $("#b2").onclick = applySample;
@@ -336,7 +336,7 @@ function renderSettings(v) {
     <div class="item">掲示場<span class="v">${l.boards.length}件</span></div>
     <button class="item link" id="s-lists">一覧を切り替える・削除する ›</button>
     <button class="item link" id="s-csv">⤓ CSVを取り込む</button></div>
-    <p class="small">端末の「ファイル」から CSV を選びます。データはこの端末の中だけに保存します。</p></div>
+    <p class="small">端末の「ファイル」から CSV を選びます。</p><p class="privacy">🔒 取り込んだ一覧・出発地点・進捗・写真は、この端末の中だけに保存され、ほかの人からは見えません。サーバーには送りません。</p></div>
   <div class="section"><h2>自宅（出発・帰着地点）</h2><div class="group">
     <div class="item">${state.home ? `登録済み: ${state.home.lat.toFixed(6)}, ${state.home.lon.toFixed(6)}` : "未登録"}</div>
     <div class="item"><input type="text" id="s-home" inputmode="decimal" placeholder="緯度,経度（例 35.3159,139.6250）"></div>

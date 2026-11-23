@@ -32,6 +32,8 @@ main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: fl
 .grow { flex: 1; }
 .muted { color: var(--ink-soft); font-size: 14px; }
 .small { font-size: 13px; color: var(--ink-soft); }
+.privacy { margin: 14px auto 0; max-width: 300px; padding: 10px 12px; border-radius: 12px; background: var(--green-pale); color: var(--green); font-size: 13px; font-weight: 700; line-height: 1.6; text-align: center; }
+.section .privacy { max-width: none; text-align: left; margin-top: 8px; }
 .warn { color: #B4561A; font-weight: 700; font-size: 14px; }
 .err { color: #C0392B; font-size: 14px; }
 

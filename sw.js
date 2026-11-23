@@ -1,5 +1,5 @@
 // オフライン対応。アプリ本体は先に保存し、地図タイルは見た分だけ保存する。
-const VERSION = "v1";
+const VERSION = "v2";
 const SHELL = `shell-${VERSION}`;
 const TILES = "tiles-v1";
 const MAX_TILES = 3000;
