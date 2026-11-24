@@ -55,6 +55,10 @@ async function loadAll() {
 let saving = false;
 async function runSave(fn) {
   if (saving) return;
+  if (externalChanged || externalSyncPromise) {
+    await syncExternalChange();
+    return;
+  }
   saving = true;
   try { return await fn(); } finally { saving = false; }
 }
@@ -86,6 +90,79 @@ async function reloadSaved() {
     return true;
   } catch {
     return false;
+  }
+}
+
+let externalChanged = false;
+let externalSyncTimer = null;
+let externalSyncPromise = null;
+
+/** 画面の途中の状態（撮影待ち・取り込み確認・自宅選びの下書き・地図選択・次の優先など）を消す。 */
+function clearTransientState() {
+  cameraTarget = null;
+  state.focus = null;
+  state.savedNumber = null;
+  state.photoNumber = null;
+  state.message = "";
+  state.query = "";
+  state.importSession = null;
+  state.homeDraft = null;
+  state.mapPick = null;
+}
+
+function resetStateToEmpty() {
+  const bundled = state.lists.get(BUNDLED_ID);
+  state.lists = bundled ? new Map([[BUNDLED_ID, bundled]]) : new Map();
+  state.activeId = BUNDLED_ID;
+  state.home = null;
+  state.progress = { assigned: [], route: [] };
+  state.done = new Map();
+}
+
+const isDisconnected = (startEpoch) =>
+  externalChanged || Boolean(externalSyncPromise) || S.connectionEpoch() !== startEpoch;
+
+/** 保存先の内容を読み直し、途中の状態を消して巡回順（データが無ければ最初の案内）の画面へ戻す。 */
+async function reloadAndReset() {
+  clearTransientState();
+  const ok = await reloadSaved();
+  clearTransientState();
+  if (!ok) resetStateToEmpty();
+  if (state.lists.has(BUNDLED_ID)) go("route");
+}
+
+/** 外からの変更・消去（close / versionchange）を 1 回だけ知らせ、保存内容を読み込み直す。 */
+async function syncExternalChange() {
+  if (externalSyncTimer) { clearTimeout(externalSyncTimer); externalSyncTimer = null; }
+  if (externalSyncPromise) return externalSyncPromise;
+  if (!externalChanged) return;
+  externalSyncPromise = (async () => {
+    let alerted = false;
+    try {
+      while (externalChanged) {
+        externalChanged = false;
+        cameraTarget = null;
+        if (!alerted) {
+          alerted = true;
+          alert("保存されているデータが、このアプリの外で変更または消去されました。保存されている内容を読み込み直します。");
+        }
+        await reloadAndReset();
+      }
+    } finally {
+      externalSyncPromise = null;
+    }
+  })();
+  return externalSyncPromise;
+}
+
+function handleStoreDisconnect() {
+  externalChanged = true;
+  cameraTarget = null;
+  if (!externalSyncPromise && !externalSyncTimer) {
+    externalSyncTimer = setTimeout(() => {
+      externalSyncTimer = null;
+      syncExternalChange();
+    }, 0);
   }
 }
 
@@ -218,14 +295,31 @@ async function renderPhoto(v) {
 }
 
 async function showPhoto(img, number) {
-  const rec = await S.photoGet(S.photoKey(state.activeId, number));
-  if (rec?.blob) img.src = URL.createObjectURL(rec.blob);
+  const view = state.view;
+  try {
+    const rec = await S.photoGet(S.photoKey(state.activeId, number));
+    if (!img?.isConnected || state.view !== view) return;
+    if (rec?.blob) img.src = URL.createObjectURL(rec.blob);
+  } catch (err) {
+    if (!img?.isConnected || state.view !== view) return;
+    const box = img.parentElement;
+    if (!box) return;
+    const p = document.createElement("p");
+    p.className = "pad err";
+    p.textContent = `写真を読み込めませんでした。（${errorMessage(err)}）`;
+    box.textContent = "";
+    box.appendChild(p);
+  }
 }
 
 // ---------- 撮影 ----------
 let cameraTarget = null;
 function openCamera(board) {
-  cameraTarget = board;
+  if (externalChanged || externalSyncPromise) {
+    syncExternalChange();
+    return;
+  }
+  cameraTarget = { board, listId: state.activeId, epoch: S.connectionEpoch() };
   state.message = "";
   const input = $("#camera");
   input.value = "";
@@ -234,28 +328,86 @@ function openCamera(board) {
 
 $("#camera").addEventListener("cancel", () => {
   if (!cameraTarget) return;
-  state.message = `${cameraTarget.number} は撮影を取り消したため未完了のままです。`;
+  const { board, listId } = cameraTarget;
   cameraTarget = null;
+  if (listId !== state.activeId) return;
+  state.message = `${board.number} は撮影を取り消したため未完了のままです。`;
   render();
 });
 
+/** 撮影の書き込み後、撮影を始めた一覧が今も保存内容にあり、使っている一覧も変わっていないか確かめる。 */
+async function isPhotoTargetValid(listId) {
+  if (state.activeId !== listId) return false;
+  const [savedList, savedActive] = await Promise.all([
+    listId === BUNDLED_ID ? Promise.resolve(true) : S.listGet(listId),
+    S.kvGet("activeListId"),
+  ]);
+  if (listId === BUNDLED_ID) return !savedActive || savedActive === BUNDLED_ID;
+  return Boolean(savedList) && savedActive === listId;
+}
+
 $("#camera").addEventListener("change", async (e) => {
   const file = e.target.files?.[0];
-  const board = cameraTarget;
+  const target = cameraTarget;
   cameraTarget = null;
-  if (!board) return;
-  if (!file) { state.message = `${board.number} は撮影を取り消したため未完了のままです。`; return render(); }
+  if (!target) return;
+  const { board, listId, epoch } = target;
+  if (!file) {
+    if (listId === state.activeId) {
+      state.message = `${board.number} は撮影を取り消したため未完了のままです。`;
+      render();
+    }
+    return;
+  }
+  const key = S.photoKey(listId, board.number);
+  const cleanupPhoto = async () => { try { await S.photoDel(key); } catch {} };
+  let wrote = false;
   try {
     const blob = await shrink(file);
+    if (isDisconnected(epoch)) {
+      await syncExternalChange();
+      return;
+    }
+    if (state.activeId !== listId || (listId !== BUNDLED_ID && !state.lists.has(listId))) {
+      alert(`${board.number} の写真を保存できませんでした。\n撮影を始めた一覧が見つからないか、別の一覧に切り替わっています。`);
+      await reloadAndReset();
+      return;
+    }
     const savedAt = Date.now();
     // 番号・写真・日時を1回の書き込みで確定。成功してから完了にする。
-    await S.photoPut({ key: S.photoKey(state.activeId, board.number), listId: state.activeId, number: board.number, blob, savedAt });
+    await S.photoPut({ key, listId, number: board.number, blob, savedAt });
+    wrote = true;
+    if (isDisconnected(epoch)) {
+      await cleanupPhoto();
+      await syncExternalChange();
+      if (state.activeId === listId && state.done.has(board.number)) await reloadAndReset();
+      return;
+    }
+    const valid = await isPhotoTargetValid(listId);
+    if (isDisconnected(epoch)) {
+      await cleanupPhoto();
+      await syncExternalChange();
+      if (state.activeId === listId && state.done.has(board.number)) await reloadAndReset();
+      return;
+    }
+    if (!valid) {
+      await cleanupPhoto();
+      alert(`${board.number} の写真を保存できませんでした。\n撮影を始めた一覧が見つからないか、別の一覧に切り替わっています。`);
+      await reloadAndReset();
+      return;
+    }
     state.done.set(board.number, { savedAt });
     state.savedNumber = board.number;
     state.focus = null;
     state.message = "";
     go("saved");
   } catch (err) {
+    if (wrote) await cleanupPhoto();
+    if (isDisconnected(epoch)) {
+      await syncExternalChange();
+      if (state.activeId === listId && state.done.has(board.number)) await reloadAndReset();
+      return;
+    }
     state.message = `${board.number} の写真を保存できませんでした。もう一度撮影してください。（${errorMessage(err)}）`;
     render();
   }
@@ -316,7 +468,7 @@ function ensureMap() {
 function renderMap() {
   setHeader("地図で見る", { icon: "✕", label: "閉じる", onClick: () => go("route") }, null);
   ensureMap();
-  setTimeout(() => { map.invalidateSize(); state.mapPick = null; drawCard(); drawMarkers(true); }, 0);
+  setTimeout(() => { if (state.view !== "map") return; map.invalidateSize(); state.mapPick = null; drawCard(); drawMarkers(true); }, 0);
 }
 
 // ---------- 自宅を地図で選ぶ ----------
@@ -324,7 +476,7 @@ function renderPickHome() {
   setHeader("自宅を地図で選ぶ", { icon: "✕", label: "やめる", onClick: () => { state.homeDraft = null; go("settings"); } }, null);
   ensureMap();
   state.homeDraft = state.homeDraft || (state.home ? { ...state.home } : null);
-  setTimeout(() => { map.invalidateSize(); drawPickHome(true); }, 0);
+  setTimeout(() => { if (state.view !== "pickhome") return; map.invalidateSize(); drawPickHome(true); }, 0);
 }
 
 function drawPickHome(fit) {
@@ -406,23 +558,29 @@ function ensureDraftVisible() {
 
 /** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
 async function setHome(c) {
+  const startEpoch = S.connectionEpoch();
   const home = { lat: c.lat, lon: c.lon };
   let wrote = false;
   try {
+    if (isDisconnected(startEpoch)) { await syncExternalChange(); return false; }
     await S.kvSet("home", home);
     wrote = true;
     for (const l2 of state.lists.values()) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return false; }
       const pg = await S.kvGet(`progress:${l2.id}`);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return false; }
       if (pg) await S.kvSet(`progress:${l2.id}`, replan({ ...pg }, l2.boards, home));
     }
     const progress = (await S.kvGet(`progress:${state.activeId}`)) || { assigned: [], route: [] };
     const done = await S.photoIndex(state.activeId);
+    if (isDisconnected(startEpoch)) { await syncExternalChange(); return false; }
     state.home = home;
     state.progress = progress;
     state.done = done;
     toast("自宅を保存しました");
     return true;
   } catch (err) {
+    if (isDisconnected(startEpoch)) { await syncExternalChange(); return false; }
     if (wrote && await reloadSaved()) render();
     alert(`自宅を保存できませんでした。\n${errorMessage(err)}`);
     return false;
@@ -536,13 +694,17 @@ function renderSettings(v) {
   });
   $("#s-homemap").onclick = () => { state.homeDraft = null; go("pickhome"); };
   $("#s-reset").onclick = () => runSave(async () => {
+    const startEpoch = S.connectionEpoch();
     if (!confirm(`「${l.name}」の写真${state.done.size}件を消します。元に戻せません。`)) return;
     try {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       await S.photoDeleteList(state.activeId);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       state.done = new Map();
       toast("写真を消しました");
       if (state.view === "settings") render();
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       alert(`写真と進捗を消せませんでした。\n${errorMessage(err)}`);
     }
   });
@@ -550,16 +712,31 @@ function renderSettings(v) {
 
 async function applySample() {
   return runSave(async () => {
+    const startEpoch = S.connectionEpoch();
     const home = { ...SAMPLE_HOME };
     const boards = state.lists.get(BUNDLED_ID).boards;
     const progress = replan({ assigned: boards.map((b) => b.number), route: [] }, boards, home);
     let wrote = false;
     try {
       const done = await S.photoIndex(BUNDLED_ID);
+      // 自宅は全一覧で共通なので、進捗があるほかの一覧の巡回順も新しい自宅で計算し直す。
+      const others = [];
+      for (const l2 of state.lists.values()) {
+        if (l2.id === BUNDLED_ID) continue;
+        const pg = await S.kvGet(`progress:${l2.id}`);
+        if (pg) others.push([l2.id, replan({ ...pg }, l2.boards, home)]);
+      }
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       await S.kvSet("home", home);
       wrote = true;
+      for (const [id, pg] of others) {
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+        await S.kvSet(`progress:${id}`, pg);
+      }
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       await S.kvSet("activeListId", BUNDLED_ID);
       await S.kvSet(`progress:${BUNDLED_ID}`, progress);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       if (state.activeId !== BUNDLED_ID) state.focus = null;
       state.home = home;
       state.activeId = BUNDLED_ID;
@@ -568,6 +745,7 @@ async function applySample() {
       toast("見本を入れました");
       go("route");
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       if (wrote && await reloadSaved()) render();
       alert(`見本を入れられませんでした。\n${errorMessage(err)}`);
     }
@@ -588,12 +766,23 @@ function renderPicker(v) {
   const qEl = $("#q");
   qEl.oninput = () => { state.query = qEl.value; const pos = qEl.selectionStart; renderPicker(v); const n = $("#q"); n.focus(); n.setSelectionRange(pos, pos); };
   const commit = (assigned) => runSave(async () => {
+    const startEpoch = S.connectionEpoch();
+    const id = state.activeId;
     try {
       const next = replan({ ...state.progress, assigned });
-      await saveProgress(next);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+      if (id !== BUNDLED_ID && !(await S.listGet(id))) {
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+        alert("担当を保存できませんでした。\n使っている一覧が見つかりません。保存されている内容を読み込み直します。");
+        await reloadAndReset();
+        return;
+      }
+      await saveProgress(next, id);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       state.progress = next;
       if (state.view === "picker") renderPicker(v);
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       alert(`担当を保存できませんでした。\n${errorMessage(err)}`);
     }
   });
@@ -615,40 +804,57 @@ function renderLists(v) {
   v.querySelectorAll("[data-use]").forEach((el) => el.onclick = () => runSave(async () => {
     const id = el.dataset.use;
     if (id === state.activeId) return;
+    const startEpoch = S.connectionEpoch();
     const left = state.progress.assigned.some((n) => !state.done.has(n));
     if (left && !confirm("巡回の途中です。切り替えても今の一覧の進捗は残り、戻せば続きから再開できます。")) return;
     try {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+      if (id !== BUNDLED_ID && !(await S.listGet(id))) {
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+        alert("一覧を切り替えられませんでした。\n選んだ一覧が見つかりません。保存されている内容を読み込み直します。");
+        await reloadAndReset();
+        return;
+      }
       const progress = (await S.kvGet(`progress:${id}`)) || { assigned: [], route: [] };
       const done = await S.photoIndex(id);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       await S.kvSet("activeListId", id);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       state.activeId = id;
       state.progress = progress;
       state.done = done;
       state.focus = null;
       if (state.view === "lists") renderLists(v);
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       alert(`一覧を切り替えられませんでした。\n${errorMessage(err)}`);
     }
   }));
   v.querySelectorAll("[data-del]").forEach((el) => el.onclick = () => runSave(async () => {
     const l = state.lists.get(el.dataset.del);
     if (!l) return;
+    const startEpoch = S.connectionEpoch();
     let wrote = false;
     try {
       const n = (await S.photoIndex(l.id)).size;
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       if (!confirm(`「${l.name}」を削除します。掲示場${l.boards.length}件と、この一覧の写真${n}件が消えます。元に戻せません。`)) return;
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       const switching = state.activeId === l.id;
       const nextProgress = switching ? (await S.kvGet(`progress:${BUNDLED_ID}`)) || { assigned: [], route: [] } : null;
       const nextDone = switching ? await S.photoIndex(BUNDLED_ID) : null;
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       await S.photoDeleteList(l.id);
       wrote = true;
       await S.kvDel(`progress:${l.id}`);
       await S.listDel(l.id);
       if (switching) await S.kvSet("activeListId", BUNDLED_ID);
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       state.lists.delete(l.id);
       if (switching) { state.activeId = BUNDLED_ID; state.progress = nextProgress; state.done = nextDone; state.focus = null; }
       if (state.view === "lists") renderLists(v);
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       if (wrote && await reloadSaved()) render();
       alert(`一覧を削除できませんでした。\n${errorMessage(err)}`);
     }
@@ -659,20 +865,24 @@ function renderLists(v) {
 $("#csvfile").addEventListener("change", async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
+  const startEpoch = S.connectionEpoch();
   try {
     if (file.size > C.MAX_BYTES) throw new C.CSVImportError("ファイルが大きすぎます。5MBまでのCSVを選んでください。");
     const table = C.readTable(await file.arrayBuffer());
+    if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
     const mapping = C.autoMapping(table.headers, table.rows);
     const name = file.name.replace(/\.[^.]+$/, "");
     state.importSession = { table, mapping, fileName: file.name, name, editing: !C.mappingProblems(mapping).ok, mode: "add" };
     go("import");
   } catch (err) {
+    if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
     alert(`CSVを読めませんでした。\n${errorMessage(err)}`);
   }
 });
 
 function renderImport(v) {
   const s = state.importSession;
+  if (!s) return go("route");
   if (s.editing) return renderMapping(v, s);
   const p = C.buildBoards(s.table, s.mapping);
   const findExisting = (name) => {
@@ -711,44 +921,68 @@ function renderImport(v) {
     s.name = nextName;
     renderImport(v);
   };
-  nm.onchange = (e) => { if (nm.isConnected) applyNameChange(e.target.value); };
+  nm.onchange = (e) => { if (nm.isConnected && state.importSession === s && !externalSyncPromise) applyNameChange(e.target.value); };
   v.querySelectorAll('[name="md"]').forEach((r) => r.onchange = () => { s.mode = r.value; updateNote(); });
   $("#remap").onclick = () => { s.editing = true; renderImport(v); };
   $("#imp").onclick = async (e) => {
     const button = e.currentTarget;
+    if (externalChanged || externalSyncPromise) { await syncExternalChange(); return; }
     if (nm.value !== s.name) { applyNameChange(nm.value); return; }
+    const startEpoch = S.connectionEpoch();
     button.disabled = true;
     try {
-      let id;
+      let id, l, nextProgress, nextDone;
       const notes = [];
       if (replacing()) {
         id = existing.id;
         const [saved, photos] = await Promise.all([S.kvGet(`progress:${id}`), S.photoIndex(id)]);
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
         if (!button.isConnected || state.view !== "import" || nm.value !== s.name || !replacing()) return;
-        const { moved, missing } = C.classifyReplacementPhotos(existing.boards, p.boards, photos.keys());
+        const { keep, moved, missing } = C.classifyReplacementPhotos(existing.boards, p.boards, photos.keys());
         const discard = moved.concat(missing);
         if (discard.length && !confirm(`「${existing.name}」を置き換えると、写真 ${photos.size}件のうち ${discard.length}件を消します（場所が変わった ${moved.length}件・新しい一覧にない ${missing.length}件）。元に戻せません。消したくないときは、キャンセルして「別の一覧として追加」を選んでください。`)) return;
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
         const pg = saved || { assigned: [], route: [] };
-        const progress = replan({ ...pg }, p.boards);
-        const removed = pg.assigned.length - progress.assigned.length;
-        const l = { ...existing, boards: p.boards, source: s.fileName, importedAt: Date.now() };
-        await S.listReplace(l, progress, discard);
-        state.lists.set(id, l);
+        nextProgress = replan({ ...pg }, p.boards);
+        nextDone = new Map(keep.map((n) => [n, photos.get(n)]));
+        const removed = pg.assigned.length - nextProgress.assigned.length;
+        l = { ...existing, boards: p.boards, source: s.fileName, importedAt: Date.now() };
+        await S.listReplace(l, nextProgress, discard);
         if (removed > 0) notes.push(`新しい一覧にない担当${removed}か所を外しました。`);
       } else {
         let name = nameT, i = 2;
-        const names = new Set([...state.lists.values()].map((l) => l.name));
+        const names = new Set([...state.lists.values()].map((x) => x.name));
         while (names.has(name)) name = `${nameT}（${i++}）`;
         id = `list-${Date.now()}`;
-        const l = { id, name, boards: p.boards, source: s.fileName, importedAt: Date.now() };
-        await S.listPut(l); state.lists.set(id, l);
-        await S.kvSet("activeListId", id);
+        l = { id, name, boards: p.boards, source: s.fileName, importedAt: Date.now() };
+        nextProgress = { assigned: [], route: [] };
+        nextDone = new Map();
+        if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+        await S.listAdd(l);
       }
-      state.activeId = id; await loadProgress();
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+      // 保存は確定済み。直後の読み込みに失敗しても取り込みは成功として扱い、画面を閉じる。
+      if (state.activeId !== id) state.focus = null;
+      state.lists.set(id, l);
+      state.activeId = id;
+      state.progress = nextProgress;
+      state.done = nextDone;
       state.importSession = null;
-      alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, "担当は「担当を選ぶ」で選んでください。"].join("\n"));
+      let loadErr = null;
+      try {
+        await loadProgress();
+      } catch (err) {
+        loadErr = err;
+      }
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
+      if (loadErr) {
+        alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, `進捗の読み込みに失敗したため、表示が合っていないことがあります。アプリを開き直してください。（${errorMessage(loadErr)}）`].join("\n"));
+      } else {
+        alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, "担当は「担当を選ぶ」で選んでください。"].join("\n"));
+      }
       go("settings");
     } catch (err) {
+      if (isDisconnected(startEpoch)) { await syncExternalChange(); return; }
       alert(`取り込みに失敗しました。\n${errorMessage(err)}`);
     } finally {
       button.disabled = false;
@@ -788,13 +1022,22 @@ function renderMapping(v, s) {
   // 古い形式の地図の保存（tiles-v1）を消す。中身を確かめられない応答で、いまの取得の形（crossOrigin）には使えず、
   // 残っていると保存済みの範囲の地図が出ない。sw.js も切り替え時に消すが、sw.js の更新が遅れても地図が出るよう、画面の側でも先に消す。
   if (window.caches) caches.delete("tiles-v1").catch(() => {});
+  S.onDisconnect(handleStoreDisconnect);
   try {
     await loadAll();
     S.requestPersist();
   } catch (err) {
+    if (externalChanged || externalSyncPromise) {
+      await syncExternalChange();
+      return;
+    }
     $("#view").innerHTML = `<p class="pad err">読み込みに失敗しました: ${esc(errorMessage(err))}</p>`;
     return;
   }
-  render();
+  if (externalChanged || externalSyncPromise) {
+    await syncExternalChange();
+  } else {
+    render();
+  }
   if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("sw.js").catch(() => {});
 })();

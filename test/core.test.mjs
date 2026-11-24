@@ -297,5 +297,308 @@ check(url.includes("api=1") && url.includes("destination=35.3%2C139.6") && url.i
   }
 }
 
+// store.js の追加・接続の開き直し（listAdd、close / versionchange イベント）
+{
+  const origIDB = globalThis.indexedDB;
+  const expectReject = async (p) => { try { await p; return null; } catch (err) { return err; } };
+  try {
+    // listAdd: 1トランザクションで一覧と activeListId を保存し、失敗・中止・同期例外時は Error で reject する
+    let nextTx;
+    globalThis.indexedDB = {
+      open: () => {
+        const req = {};
+        queueMicrotask(() => { req.result = { transaction: (stores, mode) => nextTx(stores, mode) }; req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const SA = await import("../js/store.js?listadd");
+    const ops = [];
+    nextTx = (stores, mode) => {
+      ops.push({ stores, mode });
+      const tx = {
+        error: null,
+        aborted: false,
+        abort() { this.aborted = true; },
+        objectStore: (name) => ({
+          put: (v, k) => {
+            ops.push([name, "put", k ?? v.id, v]);
+            if (name === "kv") queueMicrotask(() => tx.oncomplete?.());
+            return {};
+          },
+        }),
+      };
+      return tx;
+    };
+    await SA.listAdd({ id: "L2", name: "見本2" });
+    const reqErr = new DOMException("保存できません", "QuotaExceededError");
+    nextTx = () => {
+      const tx = {
+        error: null,
+        abort() {},
+        objectStore: (name) => ({
+          put: () => { if (name === "kv") queueMicrotask(() => tx.onerror?.({ target: { error: reqErr } })); return {}; },
+        }),
+      };
+      return tx;
+    };
+    const e1 = await expectReject(SA.listAdd({ id: "L3" }));
+    nextTx = () => {
+      const tx = {
+        error: null,
+        abort() {},
+        objectStore: (name) => ({
+          put: () => { if (name === "kv") queueMicrotask(() => tx.onabort?.({ target: tx })); return {}; },
+        }),
+      };
+      return tx;
+    };
+    const e2 = await expectReject(SA.listAdd({ id: "L4" }));
+    let syncAborted = false;
+    nextTx = () => ({
+      error: null,
+      abort() { syncAborted = true; },
+      objectStore: (name) => ({
+        put: () => { if (name === "kv") throw new Error("同期例外"); return {}; },
+      }),
+    });
+    const e3 = await expectReject(SA.listAdd({ id: "L5" }));
+    check(ops[0].stores.join() === "lists,kv" && ops[0].mode === "readwrite"
+      && ops[1][0] === "lists" && ops[1][2] === "L2"
+      && ops[2][0] === "kv" && ops[2][2] === "activeListId" && ops[2][3] === "L2"
+      && e1 === reqErr && e2 instanceof Error && e2.message.length > 0
+      && syncAborted && e3 instanceof Error && e3.message === "同期例外",
+      "store: listAdd は1トランザクションで一覧と activeListId を保存し、失敗・中止・同期例外時は Error で reject する");
+
+    const txWith = (tag) => {
+      const tx = {
+        error: null,
+        abort() {},
+        objectStore: () => ({
+          get: () => { const r = {}; queueMicrotask(() => { r.result = tag; tx.oncomplete?.(); }); return r; },
+        }),
+      };
+      return tx;
+    };
+
+    // close イベントで覚えた接続を捨て、次で開き直す（EventTarget と onclose の両方）
+    const dbs1 = [];
+    globalThis.indexedDB = {
+      open: () => {
+        const idx = dbs1.length + 1;
+        const db = Object.assign(new EventTarget(), {
+          closed: 0,
+          close() { this.closed++; },
+          transaction: () => txWith(`db${idx}`),
+        });
+        dbs1.push(db);
+        const req = {};
+        queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const SC1 = await import("../js/store.js?close-eventtarget");
+    const c1 = await SC1.kvGet("a");
+    const c2 = await SC1.kvGet("b");
+    dbs1[0].dispatchEvent(new Event("close"));
+    const c3 = await SC1.kvGet("c");
+    const c4 = await SC1.kvGet("d");
+    const dbsPlain = [];
+    globalThis.indexedDB = {
+      open: () => {
+        const idx = dbsPlain.length + 1;
+        const db = { closed: 0, close() { this.closed++; }, transaction: () => txWith(`p${idx}`) };
+        dbsPlain.push(db);
+        const req = {};
+        queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const SC2 = await import("../js/store.js?close-onclose");
+    const p1 = await SC2.kvGet("a");
+    dbsPlain[0].onclose?.();
+    const p2 = await SC2.kvGet("b");
+    check(c1 === "db1" && c2 === "db1" && c3 === "db2" && c4 === "db2" && dbs1.length === 2
+      && p1 === "p1" && p2 === "p2" && dbsPlain.length === 2,
+      "store: 接続に close イベントが来たら覚えた接続を捨てて次で開き直す");
+
+    // versionchange イベントで db.close() して捨て、次で開き直す
+    const dbs2 = [];
+    globalThis.indexedDB = {
+      open: () => {
+        const idx = dbs2.length + 1;
+        const db = Object.assign(new EventTarget(), {
+          closed: 0,
+          close() { this.closed++; },
+          transaction: () => txWith(`v${idx}`),
+        });
+        dbs2.push(db);
+        const req = {};
+        queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const SV = await import("../js/store.js?versionchange");
+    const v1 = await SV.kvGet("a");
+    dbs2[0].dispatchEvent(new Event("versionchange"));
+    const v2 = await SV.kvGet("b");
+    const v3 = await SV.kvGet("c");
+    check(v1 === "v1" && dbs2[0].closed === 1 && v2 === "v2" && v3 === "v2"
+      && dbs2.length === 2 && dbs2[1].closed === 0,
+      "store: 接続に versionchange イベントが来たら db.close() して捨て、次で開き直す");
+
+    // 古い接続の close / versionchange イベントで新しい接続を捨てない
+    dbs2[0].dispatchEvent(new Event("close"));
+    dbs2[0].dispatchEvent(new Event("versionchange"));
+    const v4 = await SV.kvGet("d");
+    check(v4 === "v2" && dbs2.length === 2 && dbs2[1].closed === 0,
+      "store: 古い接続の close / versionchange イベントで新しい接続を捨てない");
+  } finally {
+    globalThis.indexedDB = origIDB;
+  }
+}
+
+// store.js の listGet・切断通知（onDisconnect / connectionEpoch）
+{
+  const origIDB = globalThis.indexedDB;
+  const expectReject = async (p) => { try { await p; return null; } catch (err) { return err; } };
+  try {
+    // listGet: lists ストアから指定 ID の一覧を取得する
+    const storedLists = new Map([["L1", { id: "L1", name: "見本1" }]]);
+    const listOps = [];
+    globalThis.indexedDB = {
+      open: () => {
+        const req = {};
+        queueMicrotask(() => {
+          req.result = {
+            transaction: (stores, mode) => {
+              listOps.push({ stores, mode });
+              const tx = {
+                error: null,
+                abort() {},
+                objectStore: (name) => ({
+                  get: (id) => {
+                    listOps.push([name, "get", id]);
+                    const r = {};
+                    queueMicrotask(() => { r.result = storedLists.get(id); tx.oncomplete?.(); });
+                    return r;
+                  },
+                }),
+              };
+              return tx;
+            },
+          };
+          req.onsuccess?.();
+        });
+        return req;
+      },
+    };
+    const SL = await import("../js/store.js?listget");
+    const hit = await SL.listGet("L1");
+    const miss = await SL.listGet("L999");
+    check(hit?.id === "L1" && hit?.name === "見本1" && miss === undefined
+      && listOps[0].stores === "lists" && listOps[0].mode === "readonly"
+      && listOps[1][0] === "lists" && listOps[1][2] === "L1",
+      "store: listGet は指定した ID の一覧を lists から読み出す");
+
+    // onDisconnect / connectionEpoch: 1 接続につき 1 回だけ通知し、古い接続や open 失敗では呼ばない
+    const dbs = [];
+    let attempt = 0;
+    const makeSimpleTx = (tag) => {
+      const tx = {
+        error: null,
+        abort() {},
+        objectStore: () => ({
+          get: () => { const r = {}; queueMicrotask(() => { r.result = tag; tx.oncomplete?.(); }); return r; },
+        }),
+      };
+      return tx;
+    };
+    globalThis.indexedDB = {
+      open: () => {
+        attempt++;
+        if (attempt === 1) throw new Error("同期の失敗");
+        const req = { error: null };
+        queueMicrotask(() => {
+          if (attempt === 2) { req.onerror?.({ target: { error: new Error("一時エラー") } }); return; }
+          const idx = dbs.length + 1;
+          const db = Object.assign(new EventTarget(), {
+            closed: 0,
+            close() { this.closed++; },
+            transaction: () => makeSimpleTx(`d${idx}`),
+          });
+          dbs.push(db);
+          req.result = db;
+          req.onsuccess?.();
+        });
+        return req;
+      },
+    };
+    const SD = await import("../js/store.js?ondisconnect");
+    const events = [];
+    let closedAtNotify = -1;
+    const offThrow = SD.onDisconnect(() => { throw new Error("リスナー例外"); });
+    const off = SD.onDisconnect((kind) => {
+      events.push([kind, SD.connectionEpoch()]);
+      if (dbs[0]) closedAtNotify = dbs[0].closed;
+    });
+    const err1 = await expectReject(SD.kvGet("a"));
+    const err2 = await expectReject(SD.kvGet("b"));
+    const epochAfterOpenFail = SD.connectionEpoch();
+    const eventsAfterOpenFail = events.length;
+
+    const r1 = await SD.kvGet("c");
+    dbs[0].dispatchEvent(new Event("versionchange"));
+    // 同じ接続に close や versionchange が重なって来ても 2 回目は通知しない
+    dbs[0].dispatchEvent(new Event("close"));
+    dbs[0].dispatchEvent(new Event("versionchange"));
+    const r2 = await SD.kvGet("d");
+    // 新しい接続を開いたあと、古い接続のイベントでも通知せず新しい接続も捨てない
+    dbs[0].dispatchEvent(new Event("close"));
+    dbs[0].dispatchEvent(new Event("versionchange"));
+    const r3 = await SD.kvGet("e");
+    // 新しい接続の close で 2 回目が通知される
+    dbs[1].dispatchEvent(new Event("close"));
+    const r4 = await SD.kvGet("f");
+    // 解除したあとは通知されない
+    off();
+    offThrow();
+    dbs[2].dispatchEvent(new Event("close"));
+
+    check(Boolean(err1) && Boolean(err2)
+      && epochAfterOpenFail === 0 && eventsAfterOpenFail === 0
+      && r1 === "d1" && r2 === "d2" && r3 === "d2" && r4 === "d3"
+      && closedAtNotify === 1 && dbs[0].closed === 1 && dbs[1].closed === 0
+      && JSON.stringify(events) === '[["versionchange",1],["close",2]]'
+      && SD.connectionEpoch() === 3,
+      "store: onDisconnect と connectionEpoch は 1 接続につき 1 回だけ通知し、古い接続や open 失敗では呼ばない");
+
+    // EventTarget ではない plain オブジェクト（onclose / onversionchange）でも 1 回だけ通知する
+    const plainDbs = [];
+    globalThis.indexedDB = {
+      open: () => {
+        const idx = plainDbs.length + 1;
+        const db = { closed: 0, close() { this.closed++; }, transaction: () => makeSimpleTx(`p${idx}`) };
+        plainDbs.push(db);
+        const req = {};
+        queueMicrotask(() => { req.result = db; req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const SP = await import("../js/store.js?ondisconnect-plain");
+    const pEvents = [];
+    SP.onDisconnect((kind) => pEvents.push([kind, SP.connectionEpoch()]));
+    await SP.kvGet("a");
+    plainDbs[0].onversionchange?.();
+    plainDbs[0].onclose?.();
+    await SP.kvGet("b");
+    plainDbs[1].onclose?.();
+    check(plainDbs[0].closed === 1
+      && JSON.stringify(pEvents) === '[["versionchange",1],["close",2]]',
+      "store: onclose / onversionchange のみの接続でも切断通知を 1 回だけ行う");
+  } finally {
+    globalThis.indexedDB = origIDB;
+  }
+}
+
 console.log(failures ? `FAILURES: ${failures}` : "ALL PASS");
 process.exit(failures ? 1 : 0);

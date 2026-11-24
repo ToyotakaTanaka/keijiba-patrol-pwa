@@ -1,6 +1,20 @@
 // 端末内の保存（IndexedDB）。サーバーには何も送らない。
 const DB_NAME = "poster-patrol";
 let dbPromise = null;
+let dbEpoch = 0;
+const disconnectListeners = new Set();
+
+/** 保存先との接続が外からの変更や切断で切れた回数を返す（初期値は 0）。 */
+export const connectionEpoch = () => dbEpoch;
+
+/**
+ * 保存先との接続が切れたとき（close / versionchange）に呼ぶ関数を登録する。
+ * 同じ接続で versionchange と close の両方が来ても、1 回だけ呼ぶ。
+ */
+export function onDisconnect(fn) {
+  disconnectListeners.add(fn);
+  return () => disconnectListeners.delete(fn);
+}
 
 function toError(err, fallback) {
   if (err && typeof err.message === "string") return err;
@@ -12,8 +26,22 @@ const txError = (tx, e, fallback) => toError(e?.target?.error || tx?.error, fall
 
 function open() {
   if (!dbPromise) {
-    let p, failed = false;
-    const fail = (reject, err) => { failed = true; if (dbPromise === p) dbPromise = null; reject(err); };
+    let p, dropped = false, disconnected = false;
+    const drop = () => { dropped = true; if (dbPromise === p) dbPromise = null; };
+    const fail = (reject, err) => { drop(); reject(err); };
+    const onDisconnectEvent = (db, isVersionChange) => {
+      // 古い接続のイベントで新しい接続を捨てず、同じ接続の切断通知も 1 回だけにする。
+      if (disconnected) return;
+      disconnected = true;
+      drop();
+      if (isVersionChange) {
+        try { db.close?.(); } catch {}
+      }
+      dbEpoch++;
+      for (const fn of [...disconnectListeners]) {
+        try { fn(isVersionChange ? "versionchange" : "close"); } catch {}
+      }
+    };
     p = new Promise((resolve, reject) => {
       try {
         const req = indexedDB.open(DB_NAME, 1);
@@ -23,13 +51,27 @@ function open() {
           db.createObjectStore("lists", { keyPath: "id" });
           db.createObjectStore("photos", { keyPath: "key" });
         };
-        req.onsuccess = () => resolve(req.result);
+        req.onsuccess = () => {
+          const db = req.result;
+          if (db) {
+            const onClose = () => onDisconnectEvent(db, false);
+            const onVersionChange = () => onDisconnectEvent(db, true);
+            if (typeof db.addEventListener === "function") {
+              db.addEventListener("close", onClose);
+              db.addEventListener("versionchange", onVersionChange);
+            } else {
+              db.onclose = onClose;
+              db.onversionchange = onVersionChange;
+            }
+          }
+          resolve(db);
+        };
         req.onerror = (e) => fail(reject, txError(req, e, "保存先を開けませんでした"));
       } catch (err) {
         fail(reject, toError(err, "保存先を開けませんでした"));
       }
     });
-    if (!failed) dbPromise = p;
+    if (!dropped) dbPromise = p;
     return p;
   }
   return dbPromise;
@@ -58,8 +100,27 @@ export const kvSet = (key, value) => run("kv", "readwrite", (s) => s.put(value, 
 export const kvDel = (key) => run("kv", "readwrite", (s) => s.delete(key));
 
 export const listAll = () => run("lists", "readonly", (s) => s.getAll());
+export const listGet = (id) => run("lists", "readonly", (s) => s.get(id));
 export const listPut = (list) => run("lists", "readwrite", (s) => s.put(list));
 export const listDel = (id) => run("lists", "readwrite", (s) => s.delete(id));
+
+/** 一覧を保存し、使う一覧として切り替える。途中で失敗したらまとめて取り消す。 */
+export async function listAdd(list) {
+  const db = await open();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(["lists", "kv"], "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(txError(tx, e, "保存に失敗しました"));
+    tx.onabort = (e) => reject(txError(tx, e, "保存を取り消しました"));
+    try {
+      tx.objectStore("lists").put(list);
+      tx.objectStore("kv").put(list.id, "activeListId");
+    } catch (err) {
+      try { tx.abort(); } catch {}
+      reject(toError(err, "保存に失敗しました"));
+    }
+  });
+}
 
 /** 一覧と担当・巡回順を保存してから写真を消す。途中で失敗したらまとめて取り消す。 */
 export async function listReplace(list, progress, photoNumbers) {
