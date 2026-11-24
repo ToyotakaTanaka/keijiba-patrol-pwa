@@ -44,7 +44,7 @@ let threw = false;
 try { C.readTable(new ArrayBuffer(C.MAX_BYTES + 1)); } catch (err) { threw = err instanceof C.CSVImportError; }
 check(threw, "5MBを超えると読まない");
 
-// 上限（細工した CSV 対策）: 行数・列数・値の長さは、読みながら確かめてその場でやめる
+// CSV の上限と、上限に数えない空の値・行。
 {
   const fails = (text, word) => { try { table(text); return false; } catch (err) { return err instanceof C.CSVImportError && err.message.includes(word); } };
   const head = "番号,名前,緯度,経度\n";
@@ -52,16 +52,43 @@ check(threw, "5MBを超えると読まない");
   check(table(many(C.MAX_ROWS)).rows.length === C.MAX_ROWS && fails(many(C.MAX_ROWS + 1), "行が多すぎます"), "10,000行は読み、10,001行は読まない");
   const g = table(many(C.MAX_ROWS, "\n \n,,\n"));
   check(g.rows.length === C.MAX_ROWS && g.rows[0].line === 2 && g.rows[1].line === 6, "空の行は行数に数えない（行番号はファイルのまま）");
-  const wide = (n) => `${Array.from({ length: n }, (_, i) => `c${i}`).join(",")}\n${Array(n).fill("1").join(",")}\n`;
-  check(table(wide(C.MAX_COLS)).headers.length === C.MAX_COLS && fails(wide(C.MAX_COLS + 1), "列が多すぎます") && fails(`a,b\n${",".repeat(60000)}\n`, "2行目の列が多すぎます"), "200列は読み、201列は読まない");
-  const cell = (n, q = "") => `${head}1,${q}${"あ".repeat(n)}${q},35,139\n`;
-  check(table(cell(C.MAX_CELL)).rows[0].fields[1].length === C.MAX_CELL && table(cell(C.MAX_CELL, '"')).rows[0].fields[1].length === C.MAX_CELL
-    && fails(cell(C.MAX_CELL + 1), "長すぎる値") && fails(cell(C.MAX_CELL + 1, '"'), "長すぎる値"), "2,000文字の値は読み、2,001文字は読まない");
-  check(fails(`${head}1,"閉じていない${",35,139\n".repeat(1000)}`, "2行目に長すぎる値"), "閉じていない引用符で残り全部を1つの値にしない");
+  const wide = (n, tail = "") => `${Array.from({ length: n }, (_, i) => `c${i}`).join(",")}${tail}\n${Array(n).fill("1").join(",")}${tail}\n`;
+  check(table(wide(C.MAX_COLS)).headers.length === C.MAX_COLS && fails(wide(C.MAX_COLS + 1), "列が多すぎます"), "200列は読み、201列目に値があると止める");
+  const trailing = table(wide(C.MAX_COLS, ","));
+  const blanks = table(wide(C.MAX_COLS, ',,　," \t",'));
+  check([trailing, blanks].every((t) => t.headers.length === C.MAX_COLS && t.rows[0].fields.length === C.MAX_COLS)
+    && fails(wide(C.MAX_COLS, ',,　,"x"'), "列が多すぎます"), "見出しとデータの末尾の空列は200列を超えても捨てる");
+  check(fails(`a,b\n${Array(60000).fill("x").join(",")}\n`, "2行目の列が多すぎます"), "空でない値が60,000列ある行は止める");
+  const blankLines = table(`${head}${" ".repeat(C.MAX_CELL + 1)}\n${",".repeat(C.MAX_COLS)}\r\n${",".repeat(60000)}\n1,見本,35,139`);
+  check(blankLines.rows.length === 1 && blankLines.rows[0].line === 5, "長い空白行とカンマだけの長い行を読み飛ばす");
+
+  const max = "あ".repeat(C.MAX_CELL), long = max + "あ";
+  const unused = table(`${head.trimEnd()},設置場所,備考\n1,見本,35,139,,${long}\n2,見本,35,139,,"${long}"\n`);
+  check(C.buildBoards(unused, C.autoMapping(unused.headers)).boards.length === 2
+    && unused.rows.every((r) => r.fields[5] === long), "使わない列の2,001文字は取り込める");
+  const mapped = table(`${head.trimEnd()},設置場所\n  ${max} ," ${max} ",35,139,　${max}　\n${long},見本,35,139,\n3,"${long}",35,139,\n4,見本,35,139,${long}\n5,見本,${long},139,\n6,見本,35,139,\n`);
+  const mb = C.buildBoards(mapped, C.autoMapping(mapped.headers));
+  check(mb.boards.length === 2 && mb.boards[0].number === max && mb.boards[0].name === max && mb.boards[0].address === max && mb.boards[1].number === "6"
+    && JSON.stringify(mb.issues.map((i) => i.line)) === "[3,4,5,6]"
+    && ["番号", "掲示場名", "設置場所"].every((label, i) => mb.issues[i].reason === `${label}が長すぎます（2,000文字まで）`)
+    && mb.issues[3].reason === "緯度・経度を数値として読めません", "使う文字列の列は前後の空白を除いて2,000文字まで取り込む");
+
+  const quoteWarning = '引用符（"）が閉じていない可能性があります';
+  check(fails(`${head}1,"閉じていない${",35,139\n".repeat(1000)}`, quoteWarning), "閉じていない引用符が改行をまたいで長くなったら止める");
+  const multiline = `${max.slice(3)}""\r\n`;
+  const short = table(`${head}1,"${multiline}",35,139\n2,見本,35,139`);
+  check(short.rows[0].fields[1].length === C.MAX_CELL && short.rows[1].line === 4
+    && fails(`${head}1,"${multiline}あ",35,139`, quoteWarning)
+    && fails(`${head}1,"${long}\n",35,139`, quoteWarning), "改行をまたぐ引用符つきの値は2,000文字まで読む");
   const t0 = performance.now();
   let msg = "";
   try { C.readTable(new Uint8Array(C.MAX_BYTES).fill(10).buffer); } catch (err) { msg = err instanceof C.CSVImportError ? err.message : String(err); }
   check(msg.includes("見出しの行とデータの行") && performance.now() - t0 < 2000, "改行だけの5MBでもメモリを使い切らずにやめる");
+  for (const [part, label] of [[",", "カンマ"], [" ", "空白"], [",\n", "カンマと改行の繰り返し"]]) {
+    const text = part.repeat(C.MAX_BYTES / part.length);
+    const t0 = performance.now();
+    check(fails(text, "見出しの行とデータの行が見つかりませんでした。") && performance.now() - t0 < 2000, `${label}だけの5MBでもメモリを使い切らずにやめる`);
+  }
 }
 
 const sj = C.readTable(buf("test/fixtures/sjis_other_headers.csv"));
@@ -81,6 +108,17 @@ for (let k = 0; k < 20; k++) {
 }
 check(true, "無作為20点×20回: 漏れ・重複なし、提案順 ≤ 一覧の順");
 check(Math.abs(C.distance({ lat: 35, lon: 139 }, { lat: 36, lon: 139 }) - 111195) < 100, "直線距離（緯度1度 ≒ 111.2km）");
+{
+  const numbers = ["同じ", "内側", "境目", "外側", "なくなった"];
+  const old = numbers.map((number) => ({ number, lat: 0, lon: 0 }));
+  const lat = (m) => m / 6371000 / (Math.PI / 180);
+  const next = [...numbers.slice(0, 4), "古い一覧にない"].map((number, i) => ({ number, lat: lat([0, 49, 50, 51, 0][i]), lon: 0 }));
+  const photos = new Map([...numbers, "古い一覧にない", "両方の一覧にない"].map((n) => [n, {}]));
+  const result = C.classifyReplacementPhotos(old, next, photos.keys());
+  check(C.PHOTO_KEEP_DISTANCE_M === 50 && result.keep.join() === "同じ,内側,境目", "置き換えで同じ番号かつ50m以内の写真を残す");
+  check(result.moved.join() === "外側,古い一覧にない", "50mを超えた写真と古い一覧に対応する番号がない写真を場所が変わったものに分ける");
+  check(result.missing.join() === "なくなった,両方の一覧にない", "新しい一覧に番号がない写真をなくなったものに分ける");
+}
 check(C.parseLatLon("35.3,139.6") && !C.parseLatLon("91,139") && C.parseLatLon(" 35.3 ， 139.6 "), "出発地点の緯度,経度の検証");
 check(C.parseNumber("35") === 35 && C.parseNumber("35.") === 35 && C.parseNumber(".5") === 0.5 && C.parseNumber("-1.5e2") === -150 && C.parseNumber("＋３５．５") === 35.5
   && C.parseNumber("1.2.3") === null && C.parseNumber("1e") === null && C.parseNumber(".") === null && C.parseNumber("") === null && C.parseNumber("35x") === null, "数値の判定");

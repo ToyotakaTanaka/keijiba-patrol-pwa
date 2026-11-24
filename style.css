@@ -102,6 +102,10 @@ main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: fl
 #map { position: absolute; inset: 0; }
 #mapcard { position: absolute; left: 10px; right: 10px; bottom: calc(var(--safe-bottom) + 10px); z-index: 1000; }
 .mcard { background: rgba(255,255,255,.96); border-radius: 16px; padding: 14px; box-shadow: 0 4px 18px rgba(0,0,0,.18); display: flex; flex-direction: column; gap: 10px; }
+/* 自宅選びでは、下端の余白も含めて地図の6割まで。説明はカードの中をスクロールして読める。 */
+#mapcard.pickhome { max-height: calc(60% - var(--safe-bottom) - 10px); overflow-y: auto; overscroll-behavior: contain; border-radius: 16px; }
+.pickhome .mcard { padding: 12px; gap: 8px; line-height: 1.4; }
+.pickhome .btn { padding: 10px 12px; }
 .mcard .row { display: flex; align-items: flex-start; gap: 8px; }
 .mcard .row b { font-size: 19px; display: block; }
 .mcard .x { margin-left: auto; border: 0; background: #E6E8E6; width: 32px; height: 32px; border-radius: 16px; font-size: 16px; }

@@ -102,6 +102,7 @@ function go(view) { state.view = view; render(); }
 function render() {
   const onMap = state.view === "map" || state.view === "pickhome";
   $("#mapwrap").hidden = !onMap;
+  $("#mapcard").classList.toggle("pickhome", state.view === "pickhome");
   const v = $("#view");
   v.hidden = onMap;
   v.scrollTop = 0;
@@ -273,6 +274,9 @@ function ensureMap() {
       if (state.view === "pickhome") { state.homeDraft = { lat: e.latlng.lat, lon: e.latlng.lng }; drawPickHome(false); return; }
       state.mapPick = null; drawCard();
     });
+    map.on("resize", () => {
+      if (state.view === "pickhome" && $("#ph-gps")) fitPickHome(map.getZoom());
+    });
   }
 }
 
@@ -303,38 +307,52 @@ function drawPickHome(fit) {
       .on("dragend", (e) => { const p = e.target.getLatLng(); state.homeDraft = { lat: p.lat, lon: p.lng }; drawPickHome(false); })
       .addTo(layers);
   }
-  $("#mapcard").innerHTML = `<div class="mcard">
+  const card = $("#mapcard");
+  card.innerHTML = `<div class="mcard">
     <b>${d ? "この位置を自宅にしますか？" : "地図を押して、自宅の位置を選んでください"}</b>
     <div class="small">${d ? `${d.lat.toFixed(6)}, ${d.lon.toFixed(6)}（印は指で動かせます）` : "拡大してから押すと、細かく選べます。"}</div>
     <button class="btn" id="ph-ok" ${d ? "" : "disabled"}>ここを自宅にする</button>
     <button class="btn outline" id="ph-gps">現在地を使う</button>
     <div class="privacy" style="text-align:left;max-width:none;margin:0">🔒 自宅の位置はこの端末の中だけに保存され、ほかの人からは見えません。</div>
     <div class="small">地図を表示するため、見ている範囲の地図画像を国土地理院から取得します。自宅の位置そのものは送りませんが、拡大して見ている範囲は国土地理院に伝わるので、おおよその場所は分かります。</div></div>`;
+  card.scrollTop = 0;
   // 位置合わせは、下のカードを出してから（カードの高さが分かってから）行う
-  if (fit) {
-    if (d) showAboveCard(d.lat, d.lon, 16);
-    else {
-      const pts = (routeBoards().length ? routeBoards() : list().boards).map((b) => [b.lat, b.lon]);
-      if (pts.length) map.fitBounds(pts, { paddingTopLeft: [30, 30], paddingBottomRight: [30, $("#mapcard").offsetHeight + 30], maxZoom: 15 });
-      else map.setView([35.68, 139.76], 10);
-    }
-  }
+  if (fit) fitPickHome();
   $("#ph-ok").onclick = async () => { await setHome(state.homeDraft); state.homeDraft = null; go("settings"); };
   $("#ph-gps").onclick = () => {
     if (!navigator.geolocation) { toast("この端末では現在地を使えません"); return; }
     toast("現在地を確かめています…");
     navigator.geolocation.getCurrentPosition(
-      (pos) => { state.homeDraft = { lat: pos.coords.latitude, lon: pos.coords.longitude }; drawPickHome(false); showAboveCard(state.homeDraft.lat, state.homeDraft.lon, 17); },
+      (pos) => {
+        if (state.view !== "pickhome") return;
+        state.homeDraft = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        drawPickHome(false); fitPickHome(17);
+      },
       () => toast("現在地を取れませんでした。地図を押して選んでください"),
       { enableHighAccuracy: true, timeout: 15000 });
   };
 }
 
+// カードそのものの高さに加え、カードから地図の下端までの空きも含める。
+function visibleMapHeight() {
+  return $("#mapcard").getBoundingClientRect().top - map.getContainer().getBoundingClientRect().top;
+}
+
+function fitPickHome(zoom = 16) {
+  const d = state.homeDraft;
+  if (d) { showAboveCard(d.lat, d.lon, zoom); return; }
+  const assigned = routeBoards();
+  const pts = (assigned.length ? assigned : list().boards).map((b) => [b.lat, b.lon]);
+  if (!pts.length) { map.setView([35.68, 139.76], 10); return; }
+  const size = map.getSize(), visible = visibleMapHeight();
+  const x = Math.min(30, size.x / 4), y = Math.min(30, visible / 4);
+  map.fitBounds(pts, { paddingTopLeft: [x, y], paddingBottomRight: [x, size.y - visible + y], maxZoom: 15 });
+}
+
 /** 印が下のカードに隠れないよう、地図の見えている部分（カードより上）の中央に位置を合わせる。 */
 function showAboveCard(lat, lon, zoom) {
   map.setView([lat, lon], zoom, { animate: false });
-  const cardH = $("#mapcard").offsetHeight;
-  if (cardH) map.panBy([0, cardH / 2], { animate: false });
+  map.panBy([0, (map.getSize().y - visibleMapHeight()) / 2], { animate: false });
 }
 
 /** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
@@ -535,6 +553,7 @@ function renderImport(v) {
   const p = C.buildBoards(s.table, s.mapping);
   const nameT = s.name.trim();
   const existing = [...state.lists.values()].find((l) => !l.builtin && l.name === nameT);
+  const replacing = () => existing && s.mode === "replace";
   const nameErr = !nameT ? "名前を入れてください。" : nameT === BUNDLED_NAME ? "同梱の一覧と同じ名前は使えません。" : "";
   setHeader("取り込みの確認", { icon: "✕", label: "やめる", onClick: () => go("settings") }, null);
   v.innerHTML = `<div class="section"><h2>一覧の名前</h2><div class="group"><div class="item"><input type="text" id="nm" value="${esc(s.name)}"></div></div>
@@ -549,34 +568,54 @@ function renderImport(v) {
     ${p.boards.length ? `<div class="section"><h2>先頭の${Math.min(5, p.boards.length)}件</h2><table class="preview">${p.boards.slice(0, 5).map((b) => `<tr><td><b>${esc(b.number)}</b></td><td>${esc(b.name)}</td><td class="small">${b.lat}, ${b.lon}</td></tr>`).join("")}</table></div>` : '<p class="pad err">取り込める行がありません。列の選び方を確認してください。</p>'}
     <div class="btns"><button class="btn" id="imp" ${!p.boards.length || nameErr ? "disabled" : ""}>取り込む</button>
       <button class="btn plain" id="remap">列を選び直す</button>
-      <p class="small" style="text-align:center">取り込むと、この一覧に切り替わります。今の一覧の担当と写真は残ります。</p></div>`;
+      <p class="small" style="text-align:center" id="imp-note"></p></div>`;
+  const updateNote = () => {
+    $("#imp-note").textContent = replacing()
+      ? "取り込むと、同じ名前の一覧を置き換えて切り替えます。新しい一覧にある番号の担当は残ります。場所が変わった掲示場と、新しい一覧にない掲示場の写真は消します。"
+      : "取り込むと、この一覧に切り替わります。今の一覧の担当と写真は残ります。";
+  };
+  updateNote();
   $("#nm").onchange = (e) => { s.name = e.target.value; renderImport(v); };
-  v.querySelectorAll('[name="md"]').forEach((r) => r.onchange = () => { s.mode = r.value; });
+  v.querySelectorAll('[name="md"]').forEach((r) => r.onchange = () => { s.mode = r.value; updateNote(); });
   $("#remap").onclick = () => { s.editing = true; renderImport(v); };
-  $("#imp").onclick = async () => {
-    let id, notes = [];
-    if (s.mode === "replace" && existing) {
-      id = existing.id;
-      const numbers = new Set(p.boards.map((b) => b.number));
-      const pg = (await S.kvGet(`progress:${id}`)) || { assigned: [], route: [] };
-      const removed = pg.assigned.filter((n) => !numbers.has(n));
-      pg.assigned = pg.assigned.filter((n) => numbers.has(n));
-      Object.assign(existing, { boards: p.boards, source: s.fileName, importedAt: Date.now() });
-      await S.listPut(existing);
-      await S.kvSet(`progress:${id}`, replan(pg, p.boards));
-      if (removed.length) notes.push(`新しい一覧にない担当${removed.length}か所を外しました。`);
-    } else {
-      let name = nameT, i = 2;
-      const names = new Set([...state.lists.values()].map((l) => l.name));
-      while (names.has(name)) name = `${nameT}（${i++}）`;
-      id = `list-${Date.now()}`;
-      const l = { id, name, boards: p.boards, source: s.fileName, importedAt: Date.now() };
-      await S.listPut(l); state.lists.set(id, l);
+  $("#imp").onclick = async (e) => {
+    const button = e.currentTarget;
+    button.disabled = true;
+    try {
+      let id;
+      const notes = [];
+      if (replacing()) {
+        id = existing.id;
+        const [saved, photos] = await Promise.all([S.kvGet(`progress:${id}`), S.photoIndex(id)]);
+        if (!button.isConnected || state.view !== "import" || !replacing()) return;
+        const { moved, missing } = C.classifyReplacementPhotos(existing.boards, p.boards, photos.keys());
+        const discard = moved.concat(missing);
+        if (discard.length && !confirm(`置き換えると、写真 ${photos.size}件のうち ${discard.length}件を消します（場所が変わった ${moved.length}件・新しい一覧にない ${missing.length}件）。元に戻せません。消したくないときは、キャンセルして「別の一覧として追加」を選んでください。`)) return;
+        const pg = saved || { assigned: [], route: [] };
+        const progress = replan({ ...pg }, p.boards);
+        const removed = pg.assigned.length - progress.assigned.length;
+        const l = { ...existing, boards: p.boards, source: s.fileName, importedAt: Date.now() };
+        await S.listReplace(l, progress, discard);
+        state.lists.set(id, l);
+        if (removed > 0) notes.push(`新しい一覧にない担当${removed}か所を外しました。`);
+      } else {
+        let name = nameT, i = 2;
+        const names = new Set([...state.lists.values()].map((l) => l.name));
+        while (names.has(name)) name = `${nameT}（${i++}）`;
+        id = `list-${Date.now()}`;
+        const l = { id, name, boards: p.boards, source: s.fileName, importedAt: Date.now() };
+        await S.listPut(l); state.lists.set(id, l);
+        await S.kvSet("activeListId", id);
+      }
+      state.activeId = id; await loadProgress();
+      state.importSession = null;
+      alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, "担当は「担当を選ぶ」で選んでください。"].join("\n"));
+      go("settings");
+    } catch (err) {
+      alert(`取り込みに失敗しました。\n${err.message}`);
+    } finally {
+      button.disabled = false;
     }
-    state.activeId = id; await S.kvSet("activeListId", id); await loadProgress();
-    state.importSession = null;
-    alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, "担当は「担当を選ぶ」で選んでください。"].join("\n"));
-    go("settings");
   };
 }
 
@@ -584,11 +623,19 @@ function renderMapping(v, s) {
   setHeader("列を選ぶ", { icon: "✕", label: "やめる", onClick: () => go("settings") }, null);
   const first = s.table.rows[0]?.fields || [];
   const prob = C.mappingProblems(s.mapping);
+  const excerpt = (s) => {
+    let end = 0, chars = 0;
+    for (const c of s) {
+      if (chars === 60) return esc(`${s.slice(0, end)}…`);
+      chars++; end += c.length;
+    }
+    return esc(s);
+  };
   v.innerHTML = `<div class="pad small">どの列を使うかを選んでください。見出しや値から分かった列は、最初から選んであります。<br>${esc(s.fileName)}・${s.table.encoding}・${s.table.headers.length}列・${s.table.rows.length}行</div>
     ${C.FIELDS.map((f) => `<div class="section"><h2>${f.label}${f.required ? "（必須）" : ""}</h2><div class="group"><div class="item"><select data-f="${f.key}">
       <option value="">${f.required ? "未選択" : "使わない"}</option>
-      ${s.table.headers.map((h, i) => `<option value="${i}" ${s.mapping[f.key] === i ? "selected" : ""}>${i + 1}列目: ${esc(h || "（見出しなし）")}</option>`).join("")}
-    </select></div>${s.mapping[f.key] != null ? `<div class="item small">例: ${esc(first[s.mapping[f.key]] ?? "")}</div>` : ""}</div></div>`).join("")}
+      ${s.table.headers.map((h, i) => `<option value="${i}" ${s.mapping[f.key] === i ? "selected" : ""}>${i + 1}列目: ${excerpt(h || "（見出しなし）")}</option>`).join("")}
+    </select></div>${s.mapping[f.key] != null ? `<div class="item small">例: ${excerpt(first[s.mapping[f.key]] ?? "")}</div>` : ""}</div></div>`).join("")}
     <div class="pad">${prob.missing.length ? `<p class="warn">未選択: ${prob.missing.join("・")}</p>` : ""}${prob.dup.length ? `<p class="err">同じ列を選んでいます: ${prob.dup.join("・")}</p>` : ""}</div>
     <div class="btns"><button class="btn" id="nx" ${prob.ok ? "" : "disabled"}>次へ（確認画面）</button></div>`;
   v.querySelectorAll("select[data-f]").forEach((el) => el.onchange = () => {

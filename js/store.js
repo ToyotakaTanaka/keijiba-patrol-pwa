@@ -38,6 +38,28 @@ export const listAll = () => run("lists", "readonly", (s) => s.getAll());
 export const listPut = (list) => run("lists", "readwrite", (s) => s.put(list));
 export const listDel = (id) => run("lists", "readwrite", (s) => s.delete(id));
 
+/** 一覧と担当・巡回順を保存してから写真を消す。途中で失敗したらまとめて取り消す。 */
+export async function listReplace(list, progress, photoNumbers) {
+  const db = await open();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(["lists", "kv", "photos"], "readwrite");
+    const kv = tx.objectStore("kv");
+    const photos = tx.objectStore("photos");
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error || new Error("保存を取り消しました"));
+    try {
+      tx.objectStore("lists").put(list);
+      kv.put(list.id, "activeListId");
+      kv.put(progress, `progress:${list.id}`).onsuccess = () => {
+        for (const number of photoNumbers) photos.delete(photoKey(list.id, number));
+      };
+    } catch (err) {
+      tx.abort();
+      reject(err);
+    }
+  });
+}
+
 export const photoKey = (listId, number) => `${listId}#${number}`;
 /**
  * その一覧の写真のキーの範囲。"#" の次の文字 "$" の手前までを取るので、番号がどんな文字で始まっても入る

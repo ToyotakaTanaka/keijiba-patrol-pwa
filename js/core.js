@@ -3,9 +3,10 @@
 
 export const MAX_BYTES = 5 * 1024 * 1024;
 export const MAX_ROWS = 10000;
-/** 1行の列数と、1つの値の文字数の上限（細工した CSV で画面が固まったりメモリを使い切ったりしないように）。 */
+/** 取り込みに使える列数と、番号・掲示場名・設置場所の文字数の上限。 */
 export const MAX_COLS = 200;
 export const MAX_CELL = 2000;
+export const PHOTO_KEEP_DISTANCE_M = 50;
 
 export const FIELDS = [
   { key: "number", label: "番号", required: true,
@@ -41,50 +42,65 @@ export function decode(buffer) {
 
 /**
  * カンマ区切り。引用符内のカンマ・改行・"" に対応。行番号はファイル上の行（見出し=1）。
- * 空の行（値がすべて空白の行）は返さない。行数（見出し＋MAX_ROWS）・列数・値の長さの上限は
- * 読みながら確かめ、超えたらその場でやめる（全部読んでから数えると、その前にメモリを使い切る）。
+ * 空の行（値がすべて空白の行）は返さない。201列目以降の空の値はためず、空でない値があれば止める。
+ * 行数の上限と、改行をまたぐ長い引用符つきの値も、読みながら確かめる。
  */
 export function parseRecords(text) {
+  if (!/[^,\s]/.test(text)) return []; // カンマや空白だけなら、行ごとに分ける必要はない
   const records = [];
-  let fields = [], field = "", inQuotes = false, atStart = true, line = 1, start = 1;
-  const add = (c) => {
-    if (field.length >= MAX_CELL) {
-      throw new CSVImportError(`${start}行目に長すぎる値があります（1つの値は${MAX_CELL.toLocaleString("ja-JP")}文字まで）。引用符（"）が閉じていない可能性があります。`);
+  let fields = [], col = 0, hasValue = false, line = 1, start = 1;
+  let fieldStart = 0, quoteEnd = -1, escapedQuotes = 0, inQuotes = false, multiline = false;
+  const tooManyColumns = () => {
+    throw new CSVImportError(`${start}行目の列が多すぎます。${MAX_COLS}列までのCSVを選んでください。`);
+  };
+  const cut = (i, next) => {
+    if (col < MAX_COLS) {
+      let field;
+      if (text[fieldStart] === '"') {
+        field = text.slice(fieldStart + 1, quoteEnd < 0 ? i : quoteEnd);
+        if (escapedQuotes) field = field.replace(/""/g, '"');
+        if (quoteEnd >= 0 && quoteEnd + 1 < i) field += text.slice(quoteEnd + 1, i);
+      } else field = text.slice(fieldStart, i);
+      fields[col++] = field;
+      if (!hasValue && field && /\S/.test(field)) hasValue = true;
     }
-    field += c;
+    fieldStart = next; quoteEnd = -1; escapedQuotes = 0; multiline = false;
   };
-  const cut = () => {
-    if (fields.length >= MAX_COLS) throw new CSVImportError(`${start}行目の列が多すぎます。${MAX_COLS}列までのCSVを選んでください。`);
-    fields.push(field); field = ""; atStart = true;
-  };
-  const end = () => {
-    if (!fields.length && field.trim() === "") { field = ""; atStart = true; return; } // 何もない行（配列も作らない）
-    cut();
-    if (fields.some((f) => f.trim() !== "")) {
+  const end = (i, next) => {
+    cut(i, next);
+    if (hasValue) {
       if (records.length > MAX_ROWS) throw new CSVImportError(`行が多すぎます。${MAX_ROWS.toLocaleString("ja-JP")}行までのCSVを選んでください。`);
+      fields.length = col;
       records.push({ line: start, fields });
+      fields = []; hasValue = false;
     }
-    fields = [];
+    col = 0; // 空の行には配列を作り直さない
   };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inQuotes) {
       if (c === '"') {
-        if (text[i + 1] === '"') { add('"'); i++; } else inQuotes = false;
-      } else {
-        if (c === "\n" || (c === "\r" && text[i + 1] !== "\n")) line++;
-        add(c);
+        if (text[i + 1] !== '"') { quoteEnd = i; inQuotes = false; continue; }
+        escapedQuotes++; i++;
+      } else if (c === "\r" || c === "\n") {
+        multiline = true;
+        if (c === "\n" || text[i + 1] !== "\n") line++;
+      }
+      if (col === MAX_COLS && /\S/.test(c)) tooManyColumns();
+      if (multiline && i - fieldStart - escapedQuotes > MAX_CELL) {
+        throw new CSVImportError(`${start}行目に長すぎる値があります（1つの値は${MAX_CELL.toLocaleString("ja-JP")}文字まで）。引用符（"）が閉じていない可能性があります。`);
       }
       continue;
     }
-    if (c === '"' && atStart) { inQuotes = true; atStart = false; }
-    else if (c === ",") cut();
+    if (c === '"' && i === fieldStart) inQuotes = true;
+    else if (c === ",") cut(i, i + 1);
     else if (c === "\r" || c === "\n") {
+      const endOfLine = i;
       if (c === "\r" && text[i + 1] === "\n") i++;
-      end(); line++; start = line;
-    } else { add(c); atStart = false; }
+      end(endOfLine, i + 1); line++; start = line;
+    } else if (col === MAX_COLS && /\S/.test(c)) tooManyColumns();
   }
-  if (field !== "" || fields.length) end();
+  if (fieldStart < text.length || col) end(text.length, text.length);
   return records;
 }
 
@@ -93,7 +109,7 @@ export function readTable(buffer) {
     throw new CSVImportError(`ファイルが大きすぎます（${Math.round(buffer.byteLength / 1024)}KB）。5MBまでのCSVを選んでください。`);
   }
   const { text, encoding } = decode(buffer);
-  const records = parseRecords(text); // 空の行は入らない。行数・列数・値の長さの上限もここで確かめる
+  const records = parseRecords(text); // 空の行は入らない
   if (records.length < 2) throw new CSVImportError("見出しの行とデータの行が見つかりませんでした。");
   const rows = records.slice(1);
   const headers = records[0].fields.map((h) => h.replace(/[﻿​]/g, "").trim());
@@ -157,10 +173,13 @@ export function mappingProblems(m) {
 /** 行を検査して掲示場にする。通らない行は理由つきで返す。 */
 export function buildBoards(table, m) {
   const boards = [], issues = [], seen = new Set();
+  const textFields = FIELDS.filter((f) => f.key === "number" || f.key === "name" || f.key === "address");
   let outsideJapan = 0;
   for (const row of table.rows) {
     const v = (k) => (m[k] == null ? "" : String(row.fields[m[k]] ?? "").trim());
     const number = v("number"), name = v("name");
+    const long = textFields.filter((f) => v(f.key).length > MAX_CELL).map((f) => f.label);
+    if (long.length) { issues.push({ line: row.line, reason: `${long.join("・")}が長すぎます（${MAX_CELL.toLocaleString("ja-JP")}文字まで）` }); continue; }
     const empty = FIELDS.filter((f) => f.required && v(f.key) === "").map((f) => f.label);
     if (empty.length) { issues.push({ line: row.line, reason: `${empty.join("・")}が空です` }); continue; }
     const lat = parseNumber(v("latitude")), lon = parseNumber(v("longitude"));
@@ -187,6 +206,20 @@ export function distance(a, b) {
   const p1 = a.lat * rad, p2 = b.lat * rad, dp = p2 - p1, dl = (b.lon - a.lon) * rad;
   const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
   return 2 * r * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/** 置き換える一覧で、写真を残せる掲示場の番号と、消す理由ごとの番号を返す。 */
+export function classifyReplacementPhotos(oldBoards, newBoards, photoNumbers) {
+  const oldByNumber = new Map(oldBoards.map((b) => [b.number, b]));
+  const newByNumber = new Map(newBoards.map((b) => [b.number, b]));
+  const keep = [], moved = [], missing = [];
+  for (const number of photoNumbers) {
+    const oldBoard = oldByNumber.get(number), newBoard = newByNumber.get(number);
+    if (!newBoard) missing.push(number);
+    else if (oldBoard && distance(oldBoard, newBoard) <= PHOTO_KEEP_DISTANCE_M) keep.push(number);
+    else moved.push(number);
+  }
+  return { keep, moved, missing };
 }
 
 export function roundTrip(home, stops) {
