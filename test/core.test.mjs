@@ -44,6 +44,26 @@ let threw = false;
 try { C.readTable(new ArrayBuffer(C.MAX_BYTES + 1)); } catch (err) { threw = err instanceof C.CSVImportError; }
 check(threw, "5MBを超えると読まない");
 
+// 上限（細工した CSV 対策）: 行数・列数・値の長さは、読みながら確かめてその場でやめる
+{
+  const fails = (text, word) => { try { table(text); return false; } catch (err) { return err instanceof C.CSVImportError && err.message.includes(word); } };
+  const head = "番号,名前,緯度,経度\n";
+  const many = (n, gap = "") => head + Array.from({ length: n }, (_, i) => `${i + 1},n${i + 1},35,139\n${gap}`).join("");
+  check(table(many(C.MAX_ROWS)).rows.length === C.MAX_ROWS && fails(many(C.MAX_ROWS + 1), "行が多すぎます"), "10,000行は読み、10,001行は読まない");
+  const g = table(many(C.MAX_ROWS, "\n \n,,\n"));
+  check(g.rows.length === C.MAX_ROWS && g.rows[0].line === 2 && g.rows[1].line === 6, "空の行は行数に数えない（行番号はファイルのまま）");
+  const wide = (n) => `${Array.from({ length: n }, (_, i) => `c${i}`).join(",")}\n${Array(n).fill("1").join(",")}\n`;
+  check(table(wide(C.MAX_COLS)).headers.length === C.MAX_COLS && fails(wide(C.MAX_COLS + 1), "列が多すぎます") && fails(`a,b\n${",".repeat(60000)}\n`, "2行目の列が多すぎます"), "200列は読み、201列は読まない");
+  const cell = (n, q = "") => `${head}1,${q}${"あ".repeat(n)}${q},35,139\n`;
+  check(table(cell(C.MAX_CELL)).rows[0].fields[1].length === C.MAX_CELL && table(cell(C.MAX_CELL, '"')).rows[0].fields[1].length === C.MAX_CELL
+    && fails(cell(C.MAX_CELL + 1), "長すぎる値") && fails(cell(C.MAX_CELL + 1, '"'), "長すぎる値"), "2,000文字の値は読み、2,001文字は読まない");
+  check(fails(`${head}1,"閉じていない${",35,139\n".repeat(1000)}`, "2行目に長すぎる値"), "閉じていない引用符で残り全部を1つの値にしない");
+  const t0 = performance.now();
+  let msg = "";
+  try { C.readTable(new Uint8Array(C.MAX_BYTES).fill(10).buffer); } catch (err) { msg = err instanceof C.CSVImportError ? err.message : String(err); }
+  check(msg.includes("見出しの行とデータの行") && performance.now() - t0 < 2000, "改行だけの5MBでもメモリを使い切らずにやめる");
+}
+
 const sj = C.readTable(buf("test/fixtures/sjis_other_headers.csv"));
 const sjb = C.buildBoards(sj, C.autoMapping(sj.headers, sj.rows));
 check(sj.encoding === "Shift_JIS" && sjb.boards.length === 30 && sjb.issues.length === 3, "Shift_JIS（㈱を含む）を読み、誤り3行を分ける");
@@ -62,6 +82,15 @@ for (let k = 0; k < 20; k++) {
 check(true, "無作為20点×20回: 漏れ・重複なし、提案順 ≤ 一覧の順");
 check(Math.abs(C.distance({ lat: 35, lon: 139 }, { lat: 36, lon: 139 }) - 111195) < 100, "直線距離（緯度1度 ≒ 111.2km）");
 check(C.parseLatLon("35.3,139.6") && !C.parseLatLon("91,139") && C.parseLatLon(" 35.3 ， 139.6 "), "出発地点の緯度,経度の検証");
+check(C.parseNumber("35") === 35 && C.parseNumber("35.") === 35 && C.parseNumber(".5") === 0.5 && C.parseNumber("-1.5e2") === -150 && C.parseNumber("＋３５．５") === 35.5
+  && C.parseNumber("1.2.3") === null && C.parseNumber("1e") === null && C.parseNumber(".") === null && C.parseNumber("") === null && C.parseNumber("35x") === null, "数値の判定");
+{
+  const t0 = performance.now();
+  const r1 = C.parseNumber("1".repeat(2_000_000) + "x"), r2 = C.parseNumber("１".repeat(2_000_000) + "x"), r3 = C.parseNumber("1".repeat(100));
+  check(r1 === null && r2 === null && r3 === null && performance.now() - t0 < 1000, "長い数字列でも固まらない（細工したCSV対策）");
+  check(C.parseNumber("35.5" + " ".repeat(61) + "x") === null && C.parseNumber("35.5" + "　".repeat(61) + "x") === null
+    && C.parseNumber("　35.5　") === 35.5 && C.parseNumber("1".repeat(64)) !== null && C.parseNumber("1".repeat(65)) === null, "長い値の後ろにゴミがあれば数値にしない");
+}
 const url = C.googleMapsNavUrl({ lat: 35.3, lon: 139.6 });
 check(url.includes("api=1") && url.includes("destination=35.3%2C139.6") && url.includes("travelmode=driving") && url.includes("dir_action=navigate"), "Google マップの案内URL");
 

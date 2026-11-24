@@ -39,6 +39,11 @@ export const listPut = (list) => run("lists", "readwrite", (s) => s.put(list));
 export const listDel = (id) => run("lists", "readwrite", (s) => s.delete(id));
 
 export const photoKey = (listId, number) => `${listId}#${number}`;
+/**
+ * その一覧の写真のキーの範囲。"#" の次の文字 "$" の手前までを取るので、番号がどんな文字で始まっても入る
+ * （上端を「一覧ID# + U+FFFF」にすると、U+FFFF で始まる番号の写真が目録にも削除にも入らない）。
+ */
+const photoRange = (listId) => IDBKeyRange.bound(`${listId}#`, `${listId}$`, false, true);
 /** 番号・写真・日時を1回の書き込みで確定する。完了したら resolve。 */
 export const photoPut = (rec) => run("photos", "readwrite", (s) => s.put(rec));
 export const photoGet = (key) => run("photos", "readonly", (s) => s.get(key));
@@ -50,8 +55,7 @@ export async function photoIndex(listId) {
   return new Promise((resolve, reject) => {
     const out = new Map();
     const tx = db.transaction("photos", "readonly");
-    const range = IDBKeyRange.bound(`${listId}#`, `${listId}#￿`);
-    tx.objectStore("photos").openCursor(range).onsuccess = (e) => {
+    tx.objectStore("photos").openCursor(photoRange(listId)).onsuccess = (e) => {
       const c = e.target.result;
       if (c) { out.set(c.value.number, { savedAt: c.value.savedAt }); c.continue(); }
     };
@@ -64,7 +68,7 @@ export async function photoDeleteList(listId) {
   const db = await open();
   return new Promise((resolve, reject) => {
     const tx = db.transaction("photos", "readwrite");
-    tx.objectStore("photos").delete(IDBKeyRange.bound(`${listId}#`, `${listId}#￿`));
+    tx.objectStore("photos").delete(photoRange(listId));
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

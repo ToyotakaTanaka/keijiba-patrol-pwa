@@ -3,6 +3,9 @@
 
 export const MAX_BYTES = 5 * 1024 * 1024;
 export const MAX_ROWS = 10000;
+/** 1行の列数と、1つの値の文字数の上限（細工した CSV で画面が固まったりメモリを使い切ったりしないように）。 */
+export const MAX_COLS = 200;
+export const MAX_CELL = 2000;
 
 export const FIELDS = [
   { key: "number", label: "番号", required: true,
@@ -36,28 +39,50 @@ export function decode(buffer) {
   }
 }
 
-/** カンマ区切り。引用符内のカンマ・改行・"" に対応。行番号はファイル上の行（見出し=1）。 */
+/**
+ * カンマ区切り。引用符内のカンマ・改行・"" に対応。行番号はファイル上の行（見出し=1）。
+ * 空の行（値がすべて空白の行）は返さない。行数（見出し＋MAX_ROWS）・列数・値の長さの上限は
+ * 読みながら確かめ、超えたらその場でやめる（全部読んでから数えると、その前にメモリを使い切る）。
+ */
 export function parseRecords(text) {
   const records = [];
   let fields = [], field = "", inQuotes = false, atStart = true, line = 1, start = 1;
-  const end = () => { fields.push(field); records.push({ line: start, fields }); fields = []; field = ""; atStart = true; };
+  const add = (c) => {
+    if (field.length >= MAX_CELL) {
+      throw new CSVImportError(`${start}行目に長すぎる値があります（1つの値は${MAX_CELL.toLocaleString("ja-JP")}文字まで）。引用符（"）が閉じていない可能性があります。`);
+    }
+    field += c;
+  };
+  const cut = () => {
+    if (fields.length >= MAX_COLS) throw new CSVImportError(`${start}行目の列が多すぎます。${MAX_COLS}列までのCSVを選んでください。`);
+    fields.push(field); field = ""; atStart = true;
+  };
+  const end = () => {
+    if (!fields.length && field.trim() === "") { field = ""; atStart = true; return; } // 何もない行（配列も作らない）
+    cut();
+    if (fields.some((f) => f.trim() !== "")) {
+      if (records.length > MAX_ROWS) throw new CSVImportError(`行が多すぎます。${MAX_ROWS.toLocaleString("ja-JP")}行までのCSVを選んでください。`);
+      records.push({ line: start, fields });
+    }
+    fields = [];
+  };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inQuotes) {
       if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; } else inQuotes = false;
+        if (text[i + 1] === '"') { add('"'); i++; } else inQuotes = false;
       } else {
         if (c === "\n" || (c === "\r" && text[i + 1] !== "\n")) line++;
-        field += c;
+        add(c);
       }
       continue;
     }
     if (c === '"' && atStart) { inQuotes = true; atStart = false; }
-    else if (c === ",") { fields.push(field); field = ""; atStart = true; }
+    else if (c === ",") cut();
     else if (c === "\r" || c === "\n") {
       if (c === "\r" && text[i + 1] === "\n") i++;
       end(); line++; start = line;
-    } else { field += c; atStart = false; }
+    } else { add(c); atStart = false; }
   }
   if (field !== "" || fields.length) end();
   return records;
@@ -68,10 +93,9 @@ export function readTable(buffer) {
     throw new CSVImportError(`ファイルが大きすぎます（${Math.round(buffer.byteLength / 1024)}KB）。5MBまでのCSVを選んでください。`);
   }
   const { text, encoding } = decode(buffer);
-  const records = parseRecords(text).filter((r) => r.fields.some((f) => f.trim() !== ""));
+  const records = parseRecords(text); // 空の行は入らない。行数・列数・値の長さの上限もここで確かめる
   if (records.length < 2) throw new CSVImportError("見出しの行とデータの行が見つかりませんでした。");
   const rows = records.slice(1);
-  if (rows.length > MAX_ROWS) throw new CSVImportError(`行が多すぎます（${rows.length}行）。10,000行までのCSVを選んでください。`);
   const headers = records[0].fields.map((h) => h.replace(/[﻿​]/g, "").trim());
   return { headers, rows, encoding };
 }
@@ -86,8 +110,12 @@ export function normalizeHeader(s) {
 }
 
 export function parseNumber(s) {
-  const t = toHalfWidth(String(s)).trim();
-  if (t === "" || !/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) return null;
+  // 長すぎる値は数値として扱わない。正規表現は桁数に比例する時間で終わる形にしてある
+  // （細工した CSV で画面が固まらないように）。
+  const raw = String(s).trim();
+  if (raw === "" || raw.length > 64) return null;
+  const t = toHalfWidth(raw).trim();
+  if (!/^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/.test(t)) return null;
   const v = Number(t);
   return Number.isFinite(v) ? v : null;
 }

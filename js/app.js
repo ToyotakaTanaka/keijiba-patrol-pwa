@@ -227,18 +227,32 @@ $("#camera").addEventListener("change", async (e) => {
   }
 });
 
-/** 長い辺 1600px の JPEG にして保存量を抑える。位置情報などのメタデータは残らない。 */
+/**
+ * 長い辺 1600px の JPEG にして保存量を抑える。描き直すので、位置情報などのメタデータは残らない。
+ * 描き直せなかったときは、元のファイル（位置情報が入っていることがある）を保存せずに失敗にする。
+ */
 async function shrink(file) {
+  let src, w, h, release = () => {};
   try {
-    const bmp = await createImageBitmap(file);
-    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
-    const c = document.createElement("canvas");
-    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
-    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-    return await new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("画像を変換できません"))), "image/jpeg", 0.85));
+    src = await createImageBitmap(file); w = src.width; h = src.height;
+    release = () => src.close?.();
   } catch {
-    return file;
+    // createImageBitmap で読めない端末・形式は、画像として読み込んでから描き直す
+    const url = URL.createObjectURL(file);
+    release = () => URL.revokeObjectURL(url);
+    try {
+      src = new Image(); src.src = url; await src.decode();
+      w = src.naturalWidth; h = src.naturalHeight;
+    } catch { release(); throw new Error("この写真の形式は読めません"); }
   }
+  try {
+    if (!w || !h) throw new Error("この写真の形式は読めません");
+    const scale = Math.min(1, 1600 / Math.max(w, h));
+    const c = document.createElement("canvas");
+    c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+    c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+    return await new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("画像を変換できません"))), "image/jpeg", 0.85));
+  } finally { release(); }
 }
 
 // ---------- 地図 ----------
@@ -247,10 +261,12 @@ function ensureMap() {
   document.documentElement.style.setProperty("--map-top", `${$("#header").offsetHeight}px`);
   if (!map) {
     map = L.map("map", { zoomControl: true });
-    const pale = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", {
-      maxZoom: 18, attribution: '出典: <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>' });
-    const std = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", {
-      maxZoom: 18, attribution: '出典: <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>' });
+    // crossOrigin: 地図画像を中身を確かめられる形（CORS）で取得する。こうしないと、オフライン用の保存で
+    // ブラウザが1枚を数MBとして数え、端末の空き容量を圧迫する（sw.js の tile() を参照）。
+    const tileOpts = { maxZoom: 18, crossOrigin: true,
+      attribution: '出典: <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>' };
+    const pale = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", tileOpts);
+    const std = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", tileOpts);
     pale.addTo(map);
     L.control.layers({ "淡色地図": pale, "標準地図": std }, null, { position: "topright" }).addTo(map);
     map.on("click", (e) => {
@@ -287,29 +303,38 @@ function drawPickHome(fit) {
       .on("dragend", (e) => { const p = e.target.getLatLng(); state.homeDraft = { lat: p.lat, lon: p.lng }; drawPickHome(false); })
       .addTo(layers);
   }
-  if (fit) {
-    if (d) map.setView([d.lat, d.lon], 16);
-    else {
-      const pts = (routeBoards().length ? routeBoards() : list().boards).map((b) => [b.lat, b.lon]);
-      if (pts.length) map.fitBounds(pts, { padding: [30, 30], maxZoom: 15 });
-      else map.setView([35.68, 139.76], 10);
-    }
-  }
   $("#mapcard").innerHTML = `<div class="mcard">
     <b>${d ? "この位置を自宅にしますか？" : "地図を押して、自宅の位置を選んでください"}</b>
     <div class="small">${d ? `${d.lat.toFixed(6)}, ${d.lon.toFixed(6)}（印は指で動かせます）` : "拡大してから押すと、細かく選べます。"}</div>
     <button class="btn" id="ph-ok" ${d ? "" : "disabled"}>ここを自宅にする</button>
     <button class="btn outline" id="ph-gps">現在地を使う</button>
-    <div class="privacy" style="text-align:left;max-width:none;margin:0">🔒 自宅の位置はこの端末の中だけに保存され、ほかの人からは見えません。</div></div>`;
+    <div class="privacy" style="text-align:left;max-width:none;margin:0">🔒 自宅の位置はこの端末の中だけに保存され、ほかの人からは見えません。</div>
+    <div class="small">地図を表示するため、見ている範囲の地図画像を国土地理院から取得します。自宅の位置そのものは送りませんが、拡大して見ている範囲は国土地理院に伝わるので、おおよその場所は分かります。</div></div>`;
+  // 位置合わせは、下のカードを出してから（カードの高さが分かってから）行う
+  if (fit) {
+    if (d) showAboveCard(d.lat, d.lon, 16);
+    else {
+      const pts = (routeBoards().length ? routeBoards() : list().boards).map((b) => [b.lat, b.lon]);
+      if (pts.length) map.fitBounds(pts, { paddingTopLeft: [30, 30], paddingBottomRight: [30, $("#mapcard").offsetHeight + 30], maxZoom: 15 });
+      else map.setView([35.68, 139.76], 10);
+    }
+  }
   $("#ph-ok").onclick = async () => { await setHome(state.homeDraft); state.homeDraft = null; go("settings"); };
   $("#ph-gps").onclick = () => {
     if (!navigator.geolocation) { toast("この端末では現在地を使えません"); return; }
     toast("現在地を確かめています…");
     navigator.geolocation.getCurrentPosition(
-      (pos) => { state.homeDraft = { lat: pos.coords.latitude, lon: pos.coords.longitude }; map.setView([state.homeDraft.lat, state.homeDraft.lon], 17); drawPickHome(false); },
+      (pos) => { state.homeDraft = { lat: pos.coords.latitude, lon: pos.coords.longitude }; drawPickHome(false); showAboveCard(state.homeDraft.lat, state.homeDraft.lon, 17); },
       () => toast("現在地を取れませんでした。地図を押して選んでください"),
       { enableHighAccuracy: true, timeout: 15000 });
   };
+}
+
+/** 印が下のカードに隠れないよう、地図の見えている部分（カードより上）の中央に位置を合わせる。 */
+function showAboveCard(lat, lon, zoom) {
+  map.setView([lat, lon], zoom, { animate: false });
+  const cardH = $("#mapcard").offsetHeight;
+  if (cardH) map.panBy([0, cardH / 2], { animate: false });
 }
 
 /** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
@@ -387,7 +412,8 @@ function drawCard() {
   el.innerHTML = `<div class="mcard"><div class="row"><div><b>${esc(title)}</b><div>${esc(sub)}</div><div class="warn" style="color:${status === "撮影済み" ? "#0B5A45" : ""}">${esc(status)}</div></div>
     <button class="x" id="cx" aria-label="選択を外す">✕</button></div>
     <a class="btn" href="${C.googleMapsNavUrl(target)}" target="_blank" rel="noopener">➤ Google マップで案内</a>
-    ${canShoot ? '<button class="btn outline" id="cs">この掲示場を次にする</button>' : ""}</div>`;
+    ${canShoot ? '<button class="btn outline" id="cs">この掲示場を次にする</button>' : ""}
+    <div class="small">${p.home ? "帰宅案内では、目的地として自宅の位置が Google マップに渡ります。" : "案内は Google マップアプリで開きます（現在地と目的地が Google に渡ります）。"}</div></div>`;
   $("#cx").onclick = (e) => { e.stopPropagation(); state.mapPick = null; drawCard(); };
   if (canShoot) $("#cs").onclick = () => { state.focus = p.board.number; state.mapPick = null; go("next"); };
 }
@@ -402,7 +428,7 @@ function renderSettings(v) {
     <div class="item">掲示場<span class="v">${l.boards.length}件</span></div>
     <button class="item link" id="s-lists">一覧を切り替える・削除する ›</button>
     <button class="item link" id="s-csv">⤓ CSVを取り込む</button></div>
-    <p class="small">端末の「ファイル」から CSV を選びます。</p><p class="privacy">🔒 取り込んだ一覧・出発地点・進捗・写真は、この端末の中だけに保存され、ほかの人からは見えません。サーバーには送りません。</p></div>
+    <p class="small">端末の「ファイル」から CSV を選びます。</p><p class="privacy">🔒 取り込んだ一覧・出発地点・進捗・写真は、この端末の中だけに保存され、ほかの人からは見えません。このアプリには、それらを集めるサーバーがありません。このうち外に伝わるのは、案内を押したときの目的地（Google マップへ）と、地図で見た範囲（国土地理院へ）です。</p></div>
   <div class="section"><h2>自宅（出発・帰着地点）</h2><div class="group">
     <div class="item">${state.home ? `登録済み: ${state.home.lat.toFixed(6)}, ${state.home.lon.toFixed(6)}` : "未登録"}</div>
     <div class="item"><input type="text" id="s-home" inputmode="decimal" placeholder="緯度,経度（例 35.3159,139.6250）"></div>
@@ -415,7 +441,7 @@ function renderSettings(v) {
   <div class="section"><h2>記録</h2><div class="group">
     <div class="item">この一覧の写真<span class="v">${state.done.size}件</span></div>
     <button class="item danger" id="s-reset" ${state.done.size ? "" : "disabled"}>写真と進捗を消す</button></div>
-    <p class="small">地図: 国土地理院（地理院タイル）。案内: Google マップアプリ。地図表示に Google の API は使っていません。</p></div>`;
+    <p class="small">地図: 国土地理院（地理院タイル）。表示した範囲は国土地理院のサーバーに伝わります。案内: Google マップアプリ。地図表示に Google の API は使っていません。地図の部品（Leaflet）は unpkg から取得します。</p></div>`;
   $("#s-lists").onclick = () => go("lists");
   $("#s-csv").onclick = () => { $("#csvfile").value = ""; $("#csvfile").click(); };
   $("#s-pick").onclick = () => { state.query = ""; go("picker"); };
@@ -575,6 +601,9 @@ function renderMapping(v, s) {
 
 // ---------- 起動 ----------
 (async () => {
+  // 古い形式の地図の保存（tiles-v1）を消す。中身を確かめられない応答で、いまの取得の形（crossOrigin）には使えず、
+  // 残っていると保存済みの範囲の地図が出ない。sw.js も切り替え時に消すが、sw.js の更新が遅れても地図が出るよう、画面の側でも先に消す。
+  if (window.caches) caches.delete("tiles-v1").catch(() => {});
   try {
     await loadAll();
     S.requestPersist();

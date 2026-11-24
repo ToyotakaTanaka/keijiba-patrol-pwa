@@ -1,7 +1,9 @@
 // オフライン対応。アプリ本体は先に保存し、地図タイルは見た分だけ保存する。
-const VERSION = "v5";
+const VERSION = "v6";
 const SHELL = `shell-${VERSION}`;
-const TILES = "tiles-v1";
+// v2: 中身を確かめられる形（CORS）で取得した地図だけを保存する。
+// v1 は中身を確かめられない応答（opaque）を保存していて、ブラウザが1枚を数MBとして数えるため容量を圧迫していた。
+const TILES = "tiles-v2";
 const MAX_TILES = 3000;
 const FILES = [
   "./", "index.html", "style.css", "manifest.webmanifest",
@@ -24,7 +26,9 @@ self.addEventListener("install", (e) => {
 });
 
 self.addEventListener("activate", (e) => {
-  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith("shell-") && k !== SHELL).map((k) => caches.delete(k))))
+  // 古い本体と、古い形式の地図の保存（tiles-v1 など）を消す
+  const old = (k) => (k.startsWith("shell-") && k !== SHELL) || (k.startsWith("tiles-") && k !== TILES);
+  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter(old).map((k) => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
 
@@ -55,18 +59,24 @@ self.addEventListener("fetch", (e) => {
 });
 
 async function tile(req) {
-  const cache = await caches.open(TILES);
-  const hit = await cache.match(req);
-  if (hit) return hit;
+  let cache = null;
   try {
-    const res = await fetch(req);
-    if (res.ok || res.type === "opaque") {
-      await cache.put(req, res.clone());
+    cache = await caches.open(TILES);
+    // ignoreVary: 地理院タイルは Vary: Origin 付きで返る。地図の中身は取得元で変わらないので、見出しの違いでは区別しない
+    // （区別すると、保存したものが要求の形の違いで見つからず、オフラインで出ないことがある）。
+    const hit = await cache.match(req, { ignoreVary: true });
+    if (hit) return hit;
+  } catch { /* 保存を読めなくても、ネットから取得して表示する */ }
+  let res;
+  try { res = await fetch(req); } catch { return new Response("", { status: 504 }); }
+  // 保存するのは、中身を確かめられる成功の応答だけ（エラーや中身不明の応答は保存しない）
+  if (cache && res.ok) {
+    const copy = res.clone();
+    try {
+      await cache.put(req, copy);
       const keys = await cache.keys();
       if (keys.length > MAX_TILES) for (const k of keys.slice(0, keys.length - MAX_TILES)) await cache.delete(k);
-    }
-    return res;
-  } catch {
-    return new Response("", { status: 504 });
+    } catch { /* 容量がいっぱいで保存できなくても、取得した地図はそのまま表示する */ }
   }
+  return res;
 }
