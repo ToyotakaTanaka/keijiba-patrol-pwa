@@ -2,6 +2,14 @@
 const DB_NAME = "poster-patrol";
 let dbPromise;
 
+function toError(err, fallback) {
+  if (err && typeof err.message === "string") return err;
+  return new Error(typeof err === "string" && err ? err : fallback);
+}
+
+/** 要求のエラー、トランザクションのエラー、既定の文の順で Error を選ぶ。 */
+const txError = (tx, e, fallback) => toError(e?.target?.error || tx?.error, fallback);
+
 function open() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
@@ -13,7 +21,7 @@ function open() {
         db.createObjectStore("photos", { keyPath: "key" });
       };
       req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onerror = (e) => reject(txError(req, e, "保存先を開けませんでした"));
     });
   }
   return dbPromise;
@@ -23,10 +31,17 @@ async function run(store, mode, fn) {
   const db = await open();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, mode);
-    const result = fn(tx.objectStore(store));
+    const fallback = mode === "readonly" ? "読み込みに失敗しました" : "保存に失敗しました";
+    let result;
     tx.oncomplete = () => resolve(result && "result" in result ? result.result : undefined);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("保存を取り消しました"));
+    tx.onerror = (e) => reject(txError(tx, e, fallback));
+    tx.onabort = (e) => reject(txError(tx, e, mode === "readonly" ? "読み込みを取り消しました" : "保存を取り消しました"));
+    try {
+      result = fn(tx.objectStore(store));
+    } catch (err) {
+      try { tx.abort(); } catch {}
+      reject(toError(err, fallback));
+    }
   });
 }
 
@@ -46,7 +61,8 @@ export async function listReplace(list, progress, photoNumbers) {
     const kv = tx.objectStore("kv");
     const photos = tx.objectStore("photos");
     tx.oncomplete = () => resolve();
-    tx.onabort = () => reject(tx.error || new Error("保存を取り消しました"));
+    tx.onerror = (e) => reject(txError(tx, e, "保存に失敗しました"));
+    tx.onabort = (e) => reject(txError(tx, e, "保存を取り消しました"));
     try {
       tx.objectStore("lists").put(list);
       kv.put(list.id, "activeListId");
@@ -54,8 +70,8 @@ export async function listReplace(list, progress, photoNumbers) {
         for (const number of photoNumbers) photos.delete(photoKey(list.id, number));
       };
     } catch (err) {
-      tx.abort();
-      reject(err);
+      try { tx.abort(); } catch {}
+      reject(toError(err, "保存に失敗しました"));
     }
   });
 }
@@ -77,12 +93,18 @@ export async function photoIndex(listId) {
   return new Promise((resolve, reject) => {
     const out = new Map();
     const tx = db.transaction("photos", "readonly");
-    tx.objectStore("photos").openCursor(photoRange(listId)).onsuccess = (e) => {
-      const c = e.target.result;
-      if (c) { out.set(c.value.number, { savedAt: c.value.savedAt }); c.continue(); }
-    };
     tx.oncomplete = () => resolve(out);
-    tx.onerror = () => reject(tx.error);
+    tx.onerror = (e) => reject(txError(tx, e, "読み込みに失敗しました"));
+    tx.onabort = (e) => reject(txError(tx, e, "読み込みを取り消しました"));
+    try {
+      tx.objectStore("photos").openCursor(photoRange(listId)).onsuccess = (e) => {
+        const c = e.target.result;
+        if (c) { out.set(c.value.number, { savedAt: c.value.savedAt }); c.continue(); }
+      };
+    } catch (err) {
+      try { tx.abort(); } catch {}
+      reject(toError(err, "読み込みに失敗しました"));
+    }
   });
 }
 
@@ -90,9 +112,15 @@ export async function photoDeleteList(listId) {
   const db = await open();
   return new Promise((resolve, reject) => {
     const tx = db.transaction("photos", "readwrite");
-    tx.objectStore("photos").delete(photoRange(listId));
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onerror = (e) => reject(txError(tx, e, "削除に失敗しました"));
+    tx.onabort = (e) => reject(txError(tx, e, "削除を取り消しました"));
+    try {
+      tx.objectStore("photos").delete(photoRange(listId));
+    } catch (err) {
+      try { tx.abort(); } catch {}
+      reject(toError(err, "削除に失敗しました"));
+    }
   });
 }
 

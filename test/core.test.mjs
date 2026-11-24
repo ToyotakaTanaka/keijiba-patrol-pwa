@@ -132,5 +132,107 @@ check(C.parseNumber("35") === 35 && C.parseNumber("35.") === 35 && C.parseNumber
 const url = C.googleMapsNavUrl({ lat: 35.3, lon: 139.6 });
 check(url.includes("api=1") && url.includes("destination=35.3%2C139.6") && url.includes("travelmode=driving") && url.includes("dir_action=navigate"), "Google マップの案内URL");
 
+// store.js のエラー処理（要求のエラー・トランザクションのエラー・既定の文、および onabort）
+{
+  const origIDB = globalThis.indexedDB;
+  const origKeyRange = globalThis.IDBKeyRange;
+  const expectReject = async (p) => { try { await p; return null; } catch (err) { return err; } };
+  let nextTx;
+  try {
+    globalThis.IDBKeyRange = { bound: (lower, upper) => ({ lower, upper }) };
+    globalThis.indexedDB = {
+      open: () => {
+        const req = {};
+        queueMicrotask(() => {
+          req.result = { transaction: (stores, mode) => nextTx(stores, mode) };
+          req.onsuccess?.();
+        });
+        return req;
+      },
+    };
+    const S = await import("../js/store.js");
+    const makeTx = (onStart) => {
+      const tx = {
+        error: null,
+        aborted: false,
+        abort() { this.aborted = true; },
+        objectStore: (name) => ({
+          put: (...args) => { const r = {}; queueMicrotask(() => onStart(tx, name, "put", args, r)); return r; },
+          get: (...args) => { const r = {}; queueMicrotask(() => onStart(tx, name, "get", args, r)); return r; },
+          delete: (...args) => { const r = {}; queueMicrotask(() => onStart(tx, name, "delete", args, r)); return r; },
+          openCursor: (...args) => { const r = {}; queueMicrotask(() => onStart(tx, name, "openCursor", args, r)); return r; },
+        }),
+      };
+      return tx;
+    };
+
+    const reqErr = new DOMException("キーが重複しています", "ConstraintError");
+    nextTx = () => makeTx((tx) => tx.onerror?.({ target: { error: reqErr } }));
+    const e1 = await expectReject(S.photoPut({ key: "a#1" }));
+    check(e1 === reqErr && e1.message === "キーが重複しています", "store: tx.error が null でも要求のエラーで reject する");
+
+    const txErr = new Error("トランザクションのエラー");
+    nextTx = () => makeTx((tx) => { tx.error = txErr; tx.onerror?.({ target: { error: null } }); });
+    const e2 = await expectReject(S.kvSet("k", "v"));
+    check(e2 === txErr, "store: 要求のエラーがなければトランザクションのエラーで reject する");
+
+    nextTx = () => makeTx((tx) => tx.onerror?.({ target: { error: null } }));
+    const e3 = await expectReject(S.kvGet("k"));
+    check(e3 instanceof Error && e3.message.length > 0, "store: どちらのエラーも null なら既定の文の Error で reject する");
+
+    nextTx = () => makeTx((tx) => tx.onerror?.({ target: { error: reqErr } }));
+    const e4 = await expectReject(S.photoIndex("a"));
+    nextTx = () => makeTx((tx) => tx.onabort?.({ target: tx }));
+    const e5 = await expectReject(S.photoIndex("a"));
+    check(e4 === reqErr && e5 instanceof Error && e5.message.length > 0, "store: photoIndex はエラーでも中止でも Error で reject する");
+
+    nextTx = () => makeTx((tx) => tx.onerror?.({ target: { error: reqErr } }));
+    const e6 = await expectReject(S.photoDeleteList("a"));
+    nextTx = () => makeTx((tx) => tx.onabort?.({ target: tx }));
+    const e7 = await expectReject(S.photoDeleteList("a"));
+    check(e6 === reqErr && e7 instanceof Error && e7.message.length > 0, "store: photoDeleteList はエラーでも中止でも Error で reject する");
+
+    const ops = [];
+    nextTx = (stores, mode) => {
+      ops.push({ stores, mode });
+      const tx = {
+        error: null,
+        abort() {},
+        objectStore: (name) => ({
+          put: (v, k) => {
+            ops.push([name, "put", k ?? v.id]);
+            const r = {};
+            if (k === "progress:L1") queueMicrotask(() => { r.onsuccess?.(); tx.oncomplete?.(); });
+            return r;
+          },
+          delete: (k) => { ops.push([name, "delete", k]); return {}; },
+        }),
+      };
+      return tx;
+    };
+    await S.listReplace({ id: "L1" }, { assigned: [], route: [] }, ["1", "2"]);
+    nextTx = () => makeTx((tx, name) => { if (name === "lists") tx.onerror?.({ target: { error: reqErr } }); });
+    const e8 = await expectReject(S.listReplace({ id: "L1" }, { assigned: [], route: [] }, []));
+    nextTx = () => makeTx((tx, name) => { if (name === "lists") tx.onabort?.({ target: tx }); });
+    const e9 = await expectReject(S.listReplace({ id: "L1" }, { assigned: [], route: [] }, []));
+    check(ops[0].stores.join() === "lists,kv,photos" && ops.some((x) => x[0] === "photos" && x[2] === "L1#2")
+      && e8 === reqErr && e9 instanceof Error && e9.message.length > 0, "store: listReplace は1トランザクションで更新し失敗・中止時は Error で reject する");
+
+    globalThis.indexedDB = {
+      open: () => {
+        const req = { error: null };
+        queueMicrotask(() => req.onerror?.({ target: req }));
+        return req;
+      },
+    };
+    const S2 = await import("../js/store.js?openfail");
+    const e10 = await expectReject(S2.kvGet("k"));
+    check(e10 instanceof Error && e10.message.length > 0, "store: open が null エラーで失敗しても Error で reject する");
+  } finally {
+    globalThis.indexedDB = origIDB;
+    globalThis.IDBKeyRange = origKeyRange;
+  }
+}
+
 console.log(failures ? `FAILURES: ${failures}` : "ALL PASS");
 process.exit(failures ? 1 : 0);

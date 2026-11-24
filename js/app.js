@@ -12,6 +12,7 @@ const SAMPLE_HOME = { lat: 35.2785, lon: 139.6700 };
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const fmtTime = (t) => new Date(t).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+const errorMessage = (err) => String((err && typeof err === "object" ? err.message || err.name : err) || "不明なエラー");
 
 const state = {
   view: "route",        // route | next | saved | done | settings | picker | lists | import | photo
@@ -223,7 +224,7 @@ $("#camera").addEventListener("change", async (e) => {
     state.message = "";
     go("saved");
   } catch (err) {
-    state.message = `${board.number} の写真を保存できませんでした。もう一度撮影してください。（${err.message || err}）`;
+    state.message = `${board.number} の写真を保存できませんでした。もう一度撮影してください。（${errorMessage(err)}）`;
     render();
   }
 });
@@ -275,7 +276,7 @@ function ensureMap() {
       state.mapPick = null; drawCard();
     });
     map.on("resize", () => {
-      if (state.view === "pickhome" && $("#ph-gps")) fitPickHome(map.getZoom());
+      if (state.view === "pickhome" && $("#ph-gps") && map.getZoom() != null) ensureDraftVisible();
     });
   }
 }
@@ -353,6 +354,19 @@ function fitPickHome(zoom = 16) {
 function showAboveCard(lat, lon, zoom) {
   map.setView([lat, lon], zoom, { animate: false });
   map.panBy([0, (map.getSize().y - visibleMapHeight()) / 2], { animate: false });
+}
+
+/** 画面の大きさが変わったとき、印がカードより上の見えている部分から外れていれば、今の縮尺のまま見える位置へ動かす。 */
+function ensureDraftVisible() {
+  const d = state.homeDraft;
+  if (!d) return;
+  const size = map.getSize(), visible = visibleMapHeight();
+  if (size.x <= 0 || visible <= 0) return;
+  const pt = map.latLngToContainerPoint([d.lat, d.lon]);
+  const mx = Math.min(17, size.x / 2), my = Math.min(17, visible / 2);
+  const dx = pt.x < mx || pt.x > size.x - mx ? pt.x - size.x / 2 : 0;
+  const dy = pt.y < my || pt.y > visible - my ? pt.y - visible / 2 : 0;
+  if (dx || dy) map.panBy([dx, dy], { animate: false });
 }
 
 /** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
@@ -543,7 +557,7 @@ $("#csvfile").addEventListener("change", async (e) => {
     state.importSession = { table, mapping, fileName: file.name, name, editing: !C.mappingProblems(mapping).ok, mode: "add" };
     go("import");
   } catch (err) {
-    alert(`CSVを読めませんでした。\n${err.message}`);
+    alert(`CSVを読めませんでした。\n${errorMessage(err)}`);
   }
 });
 
@@ -551,8 +565,12 @@ function renderImport(v) {
   const s = state.importSession;
   if (s.editing) return renderMapping(v, s);
   const p = C.buildBoards(s.table, s.mapping);
+  const findExisting = (name) => {
+    const t = name.trim();
+    return t ? [...state.lists.values()].find((l) => !l.builtin && l.name === t) : undefined;
+  };
   const nameT = s.name.trim();
-  const existing = [...state.lists.values()].find((l) => !l.builtin && l.name === nameT);
+  const existing = findExisting(s.name);
   const replacing = () => existing && s.mode === "replace";
   const nameErr = !nameT ? "名前を入れてください。" : nameT === BUNDLED_NAME ? "同梱の一覧と同じ名前は使えません。" : "";
   setHeader("取り込みの確認", { icon: "✕", label: "やめる", onClick: () => go("settings") }, null);
@@ -575,11 +593,20 @@ function renderImport(v) {
       : "取り込むと、この一覧に切り替わります。今の一覧の担当と写真は残ります。";
   };
   updateNote();
-  $("#nm").onchange = (e) => { s.name = e.target.value; renderImport(v); };
+  const nm = $("#nm");
+  const applyNameChange = (nextName) => {
+    // 同じ名前の一覧が変わった・なくなった・新しく見つかったときは、別の一覧を誤って置き換えないよう追加へ戻す。
+    const nextExisting = findExisting(nextName);
+    if (!nextExisting || existing?.id !== nextExisting.id) s.mode = "add";
+    s.name = nextName;
+    renderImport(v);
+  };
+  nm.onchange = (e) => { if (nm.isConnected) applyNameChange(e.target.value); };
   v.querySelectorAll('[name="md"]').forEach((r) => r.onchange = () => { s.mode = r.value; updateNote(); });
   $("#remap").onclick = () => { s.editing = true; renderImport(v); };
   $("#imp").onclick = async (e) => {
     const button = e.currentTarget;
+    if (nm.value !== s.name) { applyNameChange(nm.value); return; }
     button.disabled = true;
     try {
       let id;
@@ -587,10 +614,10 @@ function renderImport(v) {
       if (replacing()) {
         id = existing.id;
         const [saved, photos] = await Promise.all([S.kvGet(`progress:${id}`), S.photoIndex(id)]);
-        if (!button.isConnected || state.view !== "import" || !replacing()) return;
+        if (!button.isConnected || state.view !== "import" || nm.value !== s.name || !replacing()) return;
         const { moved, missing } = C.classifyReplacementPhotos(existing.boards, p.boards, photos.keys());
         const discard = moved.concat(missing);
-        if (discard.length && !confirm(`置き換えると、写真 ${photos.size}件のうち ${discard.length}件を消します（場所が変わった ${moved.length}件・新しい一覧にない ${missing.length}件）。元に戻せません。消したくないときは、キャンセルして「別の一覧として追加」を選んでください。`)) return;
+        if (discard.length && !confirm(`「${existing.name}」を置き換えると、写真 ${photos.size}件のうち ${discard.length}件を消します（場所が変わった ${moved.length}件・新しい一覧にない ${missing.length}件）。元に戻せません。消したくないときは、キャンセルして「別の一覧として追加」を選んでください。`)) return;
         const pg = saved || { assigned: [], route: [] };
         const progress = replan({ ...pg }, p.boards);
         const removed = pg.assigned.length - progress.assigned.length;
@@ -612,7 +639,7 @@ function renderImport(v) {
       alert([`${p.boards.length}件で取り込み、この一覧に切り替えました。`, ...notes, "担当は「担当を選ぶ」で選んでください。"].join("\n"));
       go("settings");
     } catch (err) {
-      alert(`取り込みに失敗しました。\n${err.message}`);
+      alert(`取り込みに失敗しました。\n${errorMessage(err)}`);
     } finally {
       button.disabled = false;
     }
@@ -655,7 +682,7 @@ function renderMapping(v, s) {
     await loadAll();
     S.requestPersist();
   } catch (err) {
-    $("#view").innerHTML = `<p class="pad err">読み込みに失敗しました: ${esc(err.message)}</p>`;
+    $("#view").innerHTML = `<p class="pad err">読み込みに失敗しました: ${esc(errorMessage(err))}</p>`;
     return;
   }
   render();
