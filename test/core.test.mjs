@@ -228,6 +228,69 @@ check(url.includes("api=1") && url.includes("destination=35.3%2C139.6") && url.i
     const S2 = await import("../js/store.js?openfail");
     const e10 = await expectReject(S2.kvGet("k"));
     check(e10 instanceof Error && e10.message.length > 0, "store: open が null エラーで失敗しても Error で reject する");
+
+    const okDb = () => ({
+      transaction: () => makeTx((tx, _name, _op, _args, r) => { r.result = "ok"; tx.oncomplete?.(); }),
+    });
+
+    // open が要求エラーで失敗したら覚えた Promise を捨て、次の呼び出しで開き直して成功する（成功後は使い回す）
+    let openCount = 0;
+    globalThis.indexedDB = {
+      open: () => {
+        openCount++;
+        const req = { error: null };
+        queueMicrotask(() => {
+          if (openCount === 1) { req.onerror?.({ target: { error: new Error("一時的に開けません") } }); return; }
+          req.result = okDb();
+          req.onsuccess?.();
+        });
+        return req;
+      },
+    };
+    const S3 = await import("../js/store.js?retry-onerror");
+    const [r1, r2] = await Promise.all([expectReject(S3.kvGet("a")), expectReject(S3.kvGet("b"))]);
+    const v1 = await S3.kvGet("a");
+    const v2 = await S3.kvGet("b");
+    check(r1 instanceof Error && r1.message === "一時的に開けません" && r2 === r1
+      && v1 === "ok" && v2 === "ok" && openCount === 2,
+      "store: open が要求エラーで失敗したら次で開き直し、成功後は使い回す");
+
+    // open が同期の例外で失敗しても Error で reject し、次で開き直して成功する
+    let syncCount = 0;
+    globalThis.indexedDB = {
+      open: () => {
+        syncCount++;
+        if (syncCount === 1) throw new Error("同期の失敗");
+        if (syncCount === 2) throw "文字列の失敗";
+        const req = {};
+        queueMicrotask(() => { req.result = okDb(); req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const S4 = await import("../js/store.js?retry-sync");
+    const se1 = await expectReject(S4.kvGet("a"));
+    const se2 = await expectReject(S4.kvGet("a"));
+    const sv1 = await S4.kvGet("a");
+    const sv2 = await S4.kvGet("b");
+    check(se1 instanceof Error && se1.message === "同期の失敗"
+      && se2 instanceof Error && se2.message === "文字列の失敗"
+      && sv1 === "ok" && sv2 === "ok" && syncCount === 3,
+      "store: open が同期の例外で失敗しても Error で reject し、次で開き直す");
+
+    // 同時に複数呼ばれても open は1回だけ
+    let concCount = 0;
+    globalThis.indexedDB = {
+      open: () => {
+        concCount++;
+        const req = {};
+        queueMicrotask(() => { req.result = okDb(); req.onsuccess?.(); });
+        return req;
+      },
+    };
+    const S5 = await import("../js/store.js?concurrent");
+    const [cv1, cv2, cv3] = await Promise.all([S5.kvGet("a"), S5.kvGet("b"), S5.kvGet("c")]);
+    check(cv1 === "ok" && cv2 === "ok" && cv3 === "ok" && concCount === 1,
+      "store: 同時に複数呼ばれても open の要求は1回だけ");
   } finally {
     globalThis.indexedDB = origIDB;
     globalThis.IDBKeyRange = origKeyRange;

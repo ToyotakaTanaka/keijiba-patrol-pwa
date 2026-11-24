@@ -52,19 +52,51 @@ async function loadAll() {
   await loadProgress();
 }
 
-async function loadProgress() {
-  state.progress = (await S.kvGet(`progress:${state.activeId}`)) || { assigned: [], route: [] };
-  state.done = await S.photoIndex(state.activeId);
+let saving = false;
+async function runSave(fn) {
+  if (saving) return;
+  saving = true;
+  try { return await fn(); } finally { saving = false; }
 }
 
-async function saveProgress() { await S.kvSet(`progress:${state.activeId}`, state.progress); }
+async function loadProgress() {
+  const progress = (await S.kvGet(`progress:${state.activeId}`)) || { assigned: [], route: [] };
+  const done = await S.photoIndex(state.activeId);
+  state.progress = progress;
+  state.done = done;
+}
 
-function replan(progress = state.progress, boards = list().boards) {
+/** 保存されている内容を読み直して state を合わせる。読み直しに失敗したら false。 */
+async function reloadSaved() {
+  try {
+    const savedLists = await S.listAll();
+    const lists = new Map([[BUNDLED_ID, state.lists.get(BUNDLED_ID)]]);
+    for (const l of savedLists) lists.set(l.id, l);
+    const home = (await S.kvGet("home")) || null;
+    const active = await S.kvGet("activeListId");
+    const activeId = active && lists.has(active) ? active : BUNDLED_ID;
+    const progress = (await S.kvGet(`progress:${activeId}`)) || { assigned: [], route: [] };
+    const done = await S.photoIndex(activeId);
+    if (state.activeId !== activeId) state.focus = null;
+    state.lists = lists;
+    state.home = home;
+    state.activeId = activeId;
+    state.progress = progress;
+    state.done = done;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function saveProgress(progress = state.progress, id = state.activeId) { await S.kvSet(`progress:${id}`, progress); }
+
+function replan(progress = state.progress, boards = list().boards, home = state.home) {
   const set = new Set(progress.assigned);
   const picked = boards.filter((b) => set.has(b.number));
   progress.assigned = picked.map((b) => b.number);
-  if (!state.home) { progress.route = [...progress.assigned]; return progress; }
-  progress.route = C.planRoute(state.home, picked).map((i) => picked[i].number);
+  if (!home) { progress.route = [...progress.assigned]; return progress; }
+  progress.route = C.planRoute(home, picked).map((i) => picked[i].number);
   return progress;
 }
 
@@ -319,7 +351,10 @@ function drawPickHome(fit) {
   card.scrollTop = 0;
   // 位置合わせは、下のカードを出してから（カードの高さが分かってから）行う
   if (fit) fitPickHome();
-  $("#ph-ok").onclick = async () => { await setHome(state.homeDraft); state.homeDraft = null; go("settings"); };
+  $("#ph-ok").onclick = () => runSave(async () => {
+    if (!state.homeDraft) return;
+    if (await setHome(state.homeDraft)) { state.homeDraft = null; if (state.view === "pickhome") go("settings"); }
+  });
   $("#ph-gps").onclick = () => {
     if (!navigator.geolocation) { toast("この端末では現在地を使えません"); return; }
     toast("現在地を確かめています…");
@@ -371,12 +406,27 @@ function ensureDraftVisible() {
 
 /** 自宅を保存し、自宅は全一覧で共通なので全一覧の巡回順を計算し直す。 */
 async function setHome(c) {
-  state.home = { lat: c.lat, lon: c.lon }; await S.kvSet("home", state.home);
-  for (const l2 of state.lists.values()) {
-    const pg = await S.kvGet(`progress:${l2.id}`);
-    if (pg) await S.kvSet(`progress:${l2.id}`, replan(pg, l2.boards));
+  const home = { lat: c.lat, lon: c.lon };
+  let wrote = false;
+  try {
+    await S.kvSet("home", home);
+    wrote = true;
+    for (const l2 of state.lists.values()) {
+      const pg = await S.kvGet(`progress:${l2.id}`);
+      if (pg) await S.kvSet(`progress:${l2.id}`, replan({ ...pg }, l2.boards, home));
+    }
+    const progress = (await S.kvGet(`progress:${state.activeId}`)) || { assigned: [], route: [] };
+    const done = await S.photoIndex(state.activeId);
+    state.home = home;
+    state.progress = progress;
+    state.done = done;
+    toast("自宅を保存しました");
+    return true;
+  } catch (err) {
+    if (wrote && await reloadSaved()) render();
+    alert(`自宅を保存できませんでした。\n${errorMessage(err)}`);
+    return false;
   }
-  await loadProgress(); toast("自宅を保存しました");
 }
 
 function drawMarkers(fit) {
@@ -478,24 +528,50 @@ function renderSettings(v) {
   $("#s-csv").onclick = () => { $("#csvfile").value = ""; $("#csvfile").click(); };
   $("#s-pick").onclick = () => { state.query = ""; go("picker"); };
   $("#s-sample")?.addEventListener("click", applySample);
-  $("#s-homebtn").onclick = async () => {
+  $("#s-homebtn").onclick = () => runSave(async () => {
     const c = C.parseLatLon($("#s-home").value);
     if (!c) { $("#s-homeerr").textContent = "「緯度,経度」の形で入力してください。緯度は-90〜90、経度は-180〜180です。"; return; }
-    await setHome(c); render();
-  };
+    $("#s-homeerr").textContent = "";
+    if (await setHome(c) && state.view === "settings") render();
+  });
   $("#s-homemap").onclick = () => { state.homeDraft = null; go("pickhome"); };
-  $("#s-reset").onclick = async () => {
+  $("#s-reset").onclick = () => runSave(async () => {
     if (!confirm(`「${l.name}」の写真${state.done.size}件を消します。元に戻せません。`)) return;
-    await S.photoDeleteList(state.activeId); state.done = new Map(); toast("写真を消しました"); render();
-  };
+    try {
+      await S.photoDeleteList(state.activeId);
+      state.done = new Map();
+      toast("写真を消しました");
+      if (state.view === "settings") render();
+    } catch (err) {
+      alert(`写真と進捗を消せませんでした。\n${errorMessage(err)}`);
+    }
+  });
 }
 
 async function applySample() {
-  state.home = { ...SAMPLE_HOME }; await S.kvSet("home", state.home);
-  state.activeId = BUNDLED_ID; await S.kvSet("activeListId", BUNDLED_ID);
-  await loadProgress();
-  state.progress.assigned = state.lists.get(BUNDLED_ID).boards.map((b) => b.number); replan(); await saveProgress();
-  toast("見本を入れました"); go("route");
+  return runSave(async () => {
+    const home = { ...SAMPLE_HOME };
+    const boards = state.lists.get(BUNDLED_ID).boards;
+    const progress = replan({ assigned: boards.map((b) => b.number), route: [] }, boards, home);
+    let wrote = false;
+    try {
+      const done = await S.photoIndex(BUNDLED_ID);
+      await S.kvSet("home", home);
+      wrote = true;
+      await S.kvSet("activeListId", BUNDLED_ID);
+      await S.kvSet(`progress:${BUNDLED_ID}`, progress);
+      if (state.activeId !== BUNDLED_ID) state.focus = null;
+      state.home = home;
+      state.activeId = BUNDLED_ID;
+      state.progress = progress;
+      state.done = done;
+      toast("見本を入れました");
+      go("route");
+    } catch (err) {
+      if (wrote && await reloadSaved()) render();
+      alert(`見本を入れられませんでした。\n${errorMessage(err)}`);
+    }
+  });
 }
 
 function renderPicker(v) {
@@ -511,13 +587,21 @@ function renderPicker(v) {
     ${shown.length > 300 ? '<p class="small">300件まで表示しています。番号で絞り込んでください。</p>' : ""}</div>`;
   const qEl = $("#q");
   qEl.oninput = () => { state.query = qEl.value; const pos = qEl.selectionStart; renderPicker(v); const n = $("#q"); n.focus(); n.setSelectionRange(pos, pos); };
-  const commit = async () => { replan(); await saveProgress(); renderPicker(v); };
-  $("#all").onclick = () => { state.progress.assigned = [...new Set([...sel, ...shown.map((b) => b.number)])]; commit(); };
-  $("#none").onclick = () => { state.progress.assigned = []; commit(); };
+  const commit = (assigned) => runSave(async () => {
+    try {
+      const next = replan({ ...state.progress, assigned });
+      await saveProgress(next);
+      state.progress = next;
+      if (state.view === "picker") renderPicker(v);
+    } catch (err) {
+      alert(`担当を保存できませんでした。\n${errorMessage(err)}`);
+    }
+  });
+  $("#all").onclick = () => commit([...new Set([...sel, ...shown.map((b) => b.number)])]);
+  $("#none").onclick = () => commit([]);
   v.querySelectorAll("[data-n]").forEach((el) => el.onclick = () => {
     const n = el.dataset.n;
-    state.progress.assigned = sel.has(n) ? state.progress.assigned.filter((x) => x !== n) : [...state.progress.assigned, n];
-    commit();
+    commit(sel.has(n) ? state.progress.assigned.filter((x) => x !== n) : [...state.progress.assigned, n]);
   });
 }
 
@@ -528,21 +612,47 @@ function renderLists(v) {
     <div class="item"><button class="item" style="padding:0" data-use="${esc(l.id)}"><div><b>${esc(l.name)}</b><div class="small">${l.boards.length}件・${l.builtin ? "同梱" : `${new Date(l.importedAt).toLocaleString("ja-JP")}・${esc(l.source)}`}</div></div></button>
     ${l.id === state.activeId ? '<span class="chk on">✓</span>' : ""}${l.builtin ? "" : `<button class="x item danger" style="width:auto;padding:6px 10px" data-del="${esc(l.id)}">削除</button>`}</div>`).join("")}</div>
     <p class="small">同梱の一覧は削除できません。</p></div>`;
-  v.querySelectorAll("[data-use]").forEach((el) => el.onclick = async () => {
+  v.querySelectorAll("[data-use]").forEach((el) => el.onclick = () => runSave(async () => {
     const id = el.dataset.use;
     if (id === state.activeId) return;
     const left = state.progress.assigned.some((n) => !state.done.has(n));
     if (left && !confirm("巡回の途中です。切り替えても今の一覧の進捗は残り、戻せば続きから再開できます。")) return;
-    state.activeId = id; await S.kvSet("activeListId", id); await loadProgress(); state.focus = null; renderLists(v);
-  });
-  v.querySelectorAll("[data-del]").forEach((el) => el.onclick = async () => {
+    try {
+      const progress = (await S.kvGet(`progress:${id}`)) || { assigned: [], route: [] };
+      const done = await S.photoIndex(id);
+      await S.kvSet("activeListId", id);
+      state.activeId = id;
+      state.progress = progress;
+      state.done = done;
+      state.focus = null;
+      if (state.view === "lists") renderLists(v);
+    } catch (err) {
+      alert(`一覧を切り替えられませんでした。\n${errorMessage(err)}`);
+    }
+  }));
+  v.querySelectorAll("[data-del]").forEach((el) => el.onclick = () => runSave(async () => {
     const l = state.lists.get(el.dataset.del);
-    const n = (await S.photoIndex(l.id)).size;
-    if (!confirm(`「${l.name}」を削除します。掲示場${l.boards.length}件と、この一覧の写真${n}件が消えます。元に戻せません。`)) return;
-    await S.photoDeleteList(l.id); await S.kvDel(`progress:${l.id}`); await S.listDel(l.id); state.lists.delete(l.id);
-    if (state.activeId === l.id) { state.activeId = BUNDLED_ID; await S.kvSet("activeListId", BUNDLED_ID); await loadProgress(); }
-    renderLists(v);
-  });
+    if (!l) return;
+    let wrote = false;
+    try {
+      const n = (await S.photoIndex(l.id)).size;
+      if (!confirm(`「${l.name}」を削除します。掲示場${l.boards.length}件と、この一覧の写真${n}件が消えます。元に戻せません。`)) return;
+      const switching = state.activeId === l.id;
+      const nextProgress = switching ? (await S.kvGet(`progress:${BUNDLED_ID}`)) || { assigned: [], route: [] } : null;
+      const nextDone = switching ? await S.photoIndex(BUNDLED_ID) : null;
+      await S.photoDeleteList(l.id);
+      wrote = true;
+      await S.kvDel(`progress:${l.id}`);
+      await S.listDel(l.id);
+      if (switching) await S.kvSet("activeListId", BUNDLED_ID);
+      state.lists.delete(l.id);
+      if (switching) { state.activeId = BUNDLED_ID; state.progress = nextProgress; state.done = nextDone; state.focus = null; }
+      if (state.view === "lists") renderLists(v);
+    } catch (err) {
+      if (wrote && await reloadSaved()) render();
+      alert(`一覧を削除できませんでした。\n${errorMessage(err)}`);
+    }
+  }));
 }
 
 // ---------- CSV取り込み ----------

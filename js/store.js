@@ -1,6 +1,6 @@
 // 端末内の保存（IndexedDB）。サーバーには何も送らない。
 const DB_NAME = "poster-patrol";
-let dbPromise;
+let dbPromise = null;
 
 function toError(err, fallback) {
   if (err && typeof err.message === "string") return err;
@@ -12,17 +12,25 @@ const txError = (tx, e, fallback) => toError(e?.target?.error || tx?.error, fall
 
 function open() {
   if (!dbPromise) {
-    dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, 1);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        db.createObjectStore("kv");
-        db.createObjectStore("lists", { keyPath: "id" });
-        db.createObjectStore("photos", { keyPath: "key" });
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = (e) => reject(txError(req, e, "保存先を開けませんでした"));
+    let p, failed = false;
+    const fail = (reject, err) => { failed = true; if (dbPromise === p) dbPromise = null; reject(err); };
+    p = new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          db.createObjectStore("kv");
+          db.createObjectStore("lists", { keyPath: "id" });
+          db.createObjectStore("photos", { keyPath: "key" });
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = (e) => fail(reject, txError(req, e, "保存先を開けませんでした"));
+      } catch (err) {
+        fail(reject, toError(err, "保存先を開けませんでした"));
+      }
     });
+    if (!failed) dbPromise = p;
+    return p;
   }
   return dbPromise;
 }
